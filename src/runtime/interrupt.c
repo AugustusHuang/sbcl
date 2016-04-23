@@ -68,6 +68,28 @@
 #include "genesis/simple-fun.h"
 #include "genesis/cons.h"
 
+/*
+ * This is a workaround for some slightly silly Linux/GNU Libc
+ * behaviour: glibc defines sigset_t to support 1024 signals, which is
+ * more than the kernel.  This is usually not a problem, but becomes
+ * one when we want to save a signal mask from a ucontext, and restore
+ * it later into another ucontext: the ucontext is allocated on the
+ * stack by the kernel, so copying a libc-sized sigset_t into it will
+ * overflow and cause other data on the stack to be corrupted */
+/* FIXME: do not rely on NSIG being a multiple of 8 */
+
+#ifdef LISP_FEATURE_WIN32
+# define REAL_SIGSET_SIZE_BYTES (4)
+#else
+# define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
+#endif
+
+static inline void
+sigcopyset(sigset_t *new, sigset_t *old)
+{
+    memcpy(new, old, REAL_SIGSET_SIZE_BYTES);
+}
+
 /* When we catch an internal error, should we pass it back to Lisp to
  * be handled in a high-level way? (Early in cold init, the answer is
  * 'no', because Lisp is still too brain-dead to handle anything.
@@ -1460,7 +1482,9 @@ arrange_return_to_c_function(os_context_t *context,
      * must obviously exist in reality.  That would be post_signal_tramp
      */
 
+#ifndef LISP_FEATURE_DARWIN
     u32 *sp=(u32 *)*os_context_register_addr(context,reg_ESP);
+#endif
 
 #if defined(LISP_FEATURE_DARWIN)
     u32 *register_save_area = (u32 *)os_validate(0, 0x40);
@@ -1597,7 +1621,9 @@ void
 arrange_return_to_lisp_function(os_context_t *context, lispobj function)
 {
 #if defined(LISP_FEATURE_DARWIN) && defined(LISP_FEATURE_X86)
-    arrange_return_to_c_function(context, call_into_lisp_tramp, function);
+    arrange_return_to_c_function(context,
+                                 (call_into_lisp_lookalike)call_into_lisp_tramp,
+                                 function);
 #else
     arrange_return_to_c_function(context, call_into_lisp, function);
 #endif

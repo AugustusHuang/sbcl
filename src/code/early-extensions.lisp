@@ -112,20 +112,6 @@
                                                           data-offset)
         `(integer ,min ,max)))))
 
-;;; Similar to FUNCTION, but the result type is "exactly" specified:
-;;; if it is an object type, then the function returns exactly one
-;;; value, if it is a short form of VALUES, then this short form
-;;; specifies the exact number of values.
-(def!type sfunction (args &optional result)
-  (let ((result (cond ((eq result '*) '*)
-                      ((or (atom result)
-                           (not (eq (car result) 'values)))
-                       `(values ,result &optional))
-                      ((intersection (cdr result) sb!xc:lambda-list-keywords)
-                       result)
-                      (t `(values ,@(cdr result) &optional)))))
-    `(function ,args ,result)))
-
 ;;; the default value used for initializing character data. The ANSI
 ;;; spec says this is arbitrary, so we use the value that falls
 ;;; through when we just let the low-level consing code initialize
@@ -241,19 +227,11 @@
 ;;;;
 ;;;; comment from CMU CL: "the ultimate collection macro..."
 
-;;; helper functions for COLLECT, which become the expanders of the
-;;; MACROLET definitions created by COLLECT
-;;;
-;;; COLLECT-NORMAL-EXPANDER handles normal collection macros.
-;;;
-;;; COLLECT-LIST-EXPANDER handles the list collection case. N-TAIL
-;;; is the pointer to the current tail of the list, or NIL if the list
-;;; is empty.
+;;; helper function for COLLECT, which becomes the expander of the
+;;; MACROLET definitions created by COLLECT if collecting a list.
+;;; N-TAIL is the pointer to the current tail of the list,  or NIL
+;;; if the list is empty.
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun collect-normal-expander (n-value fun forms)
-    `(progn
-       ,@(mapcar (lambda (form) `(setq ,n-value (,fun ,form ,n-value))) forms)
-       ,n-value))
   (defun collect-list-expander (n-value n-tail forms)
     (let ((n-res (gensym)))
       `(progn
@@ -291,29 +269,23 @@
         (binds ())
         (ignores ()))
     (dolist (spec collections)
-      (unless (proper-list-of-length-p spec 1 3)
-        (error "malformed collection specifier: ~S" spec))
-      (let* ((name (first spec))
-             (default (second spec))
-             (kind (or (third spec) 'collect))
-             (n-value (gensym (concatenate 'string
-                                           (symbol-name name)
-                                           "-N-VALUE-"))))
+      (destructuring-bind (name &optional default collector
+                                &aux (n-value (copy-symbol name))) spec
         (push `(,n-value ,default) binds)
-        (if (eq kind 'collect)
-          (let ((n-tail (gensym (concatenate 'string
-                                             (symbol-name name)
-                                             "-N-TAIL-"))))
-            (push n-tail ignores)
-            (if default
-              (push `(,n-tail (last ,n-value)) binds)
-              (push n-tail binds))
-            (push `(,name (&rest args)
-                     (collect-list-expander ',n-value ',n-tail args))
-                  macros))
-          (push `(,name (&rest args)
-                   (collect-normal-expander ',n-value ',kind args))
-                macros))))
+        (let ((macro-body
+               (if (or (null collector) (eq collector 'collect))
+                   (let ((n-tail
+                          (make-symbol
+                           (concatenate 'string (symbol-name name) "-TAIL"))))
+                     (push n-tail ignores)
+                     (push `(,n-tail ,(if default `(last ,n-value))) binds)
+                     `(collect-list-expander ',n-value ',n-tail args))
+                   ``(progn
+                       ,@(mapcar (lambda (x)
+                                   `(setq ,',n-value (,',collector ,x ,',n-value)))
+                                 args)
+                       ,',n-value))))
+          (push `(,name (&rest args) ,macro-body) macros))))
     `(macrolet ,macros
        (let* ,(nreverse binds)
          ;; Even if the user reads each collection result,
@@ -482,7 +454,7 @@
 ;;; Of course, since some other host Lisps don't seem to think that's
 ;;; acceptable syntax anyway, you're pretty much prevented from writing it.
 ;;;
-(def!macro binding* ((&rest clauses) &body body)
+(defmacro binding* ((&rest clauses) &body body)
   (unless clauses ; wrap in LET to preserve non-toplevelness
     (return-from binding* `(let () ,@body)))
   (multiple-value-bind (body decls) (parse-body body nil)
@@ -1173,7 +1145,7 @@
                        (:test (setq test (second option)))
                        (t
                         (error "bad option: ~S" (first option)))))))))))
-    `(sb!xc:defmethod print-object ((structure ,name) ,stream)
+    `(defmethod print-object ((structure ,name) ,stream)
        (pprint-logical-block (,stream nil)
          (print-unreadable-object (structure
                                    ,stream

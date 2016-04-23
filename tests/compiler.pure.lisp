@@ -3547,7 +3547,9 @@
              (assert (equal (apply #'concatenate type args)
                             res))
              (assert (typep res type)))))
+    #+sb-unicode
     (test 'string "%CONCATENATE-TO-STRING")
+    #+sb-unicode
     (test 'simple-string "%CONCATENATE-TO-STRING")
     (test 'base-string "%CONCATENATE-TO-BASE-STRING")
     (test 'simple-base-string "%CONCATENATE-TO-BASE-STRING")))
@@ -3832,10 +3834,7 @@
 
 (with-test (:name :bug-384892)
   (assert (equal
-           ;; The assertion that BOOLEAN becomes (MEMBER T NIL)
-           ;; is slightly brittle, but the rest of the
-           ;; assertion is ok.
-           '(function (fixnum fixnum &key (:k1 (member t nil)))
+           '(function (fixnum fixnum &key (:k1 boolean))
              (values (member t) &optional))
            (sb-kernel:%simple-fun-type
             (checked-compile `(lambda (x y &key k1)
@@ -4080,19 +4079,21 @@
                    (sb-kernel:%simple-fun-type f)))))
 
 (with-test (:name (:bug-793771 *))
-  (let ((f (compile nil `(lambda (x)
-                            (declare (type (single-float (0.0)) x))
-                           (* x 0.1)))))
+  (let ((f (checked-compile
+            `(lambda (x)
+               (declare (type (single-float (0.0)) x))
+               (* x 0.1)))))
     (assert (equal `(function ((single-float (0.0)))
-                              (values (or (member 0.0) (single-float (0.0))) &optional))
+                              (values (single-float 0.0) &optional))
                    (sb-kernel:%simple-fun-type f)))))
 
 (with-test (:name (:bug-793771 /))
-  (let ((f (compile nil `(lambda (x)
-                            (declare (type (single-float (0.0)) x))
-                           (/ x 3.0)))))
+  (let ((f (checked-compile
+            `(lambda (x)
+               (declare (type (single-float (0.0)) x))
+               (/ x 3.0)))))
     (assert (equal `(function ((single-float (0.0)))
-                              (values (or (member 0.0) (single-float (0.0))) &optional))
+                              (values (single-float 0.0) &optional))
                    (sb-kernel:%simple-fun-type f)))))
 
 (with-test (:name (:bug-486812 single-float))

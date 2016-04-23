@@ -71,7 +71,7 @@
 (defun allocate-standard-funcallable-instance
     (wrapper &optional (slots-init nil slots-init-p))
   (let ((fin (%make-standard-funcallable-instance
-              nil (get-instance-hash-code))))
+              nil (sb-impl::new-instance-hash-code))))
     (set-funcallable-instance-function
      fin
      #'(lambda (&rest args)
@@ -206,7 +206,6 @@
                                   (t
                                    (!boot-make-wrapper (length slots) name))))
                    (proto nil))
-              (when (eq name t) (setq *the-wrapper-of-t* wrapper))
               (set (make-class-symbol name) class)
               (dolist (slot slots)
                 (unless (eq (getf slot :allocation :instance) :instance)
@@ -540,7 +539,6 @@
                (lclass (find-classoid name))
                (wrapper (classoid-layout lclass)))
           (set (get-built-in-class-symbol name) class)
-          (set (get-built-in-wrapper-symbol name) wrapper)
           (setf (classoid-pcl-class lclass) class)
 
           (!bootstrap-initialize-class 'built-in-class class

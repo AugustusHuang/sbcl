@@ -20,11 +20,6 @@
         name
         class)))
 
-(defun fun-name (x)
-  (if (typep x 'standard-generic-function)
-      (sb-pcl:generic-function-name x)
-      (%fun-name x)))
-
 ;;;; the ANSI interface to function names (and to other stuff too)
 ;;; Note: this function gets called by the compiler (as of 1.0.17.x,
 ;;; in MAYBE-INLINE-SYNTACTIC-CLOSURE), and so although ANSI says
@@ -681,12 +676,11 @@
       (terpri stream))
     (when (and (consp name) (eq 'setf (car name)) (not (cddr name)))
       (let* ((name2 (second name))
-             (inverse (info :setf :inverse name2))
              (expander (info :setf :expander name2)))
-        (cond (inverse
+        (cond ((typep expander '(and symbol (not null)))
                (pprint-logical-block (stream nil)
                  (format stream "~&~A has setf-expansion: ~S"
-                         name inverse)
+                         name expander)
                  (pprint-indent :block 2 stream)
                  (describe-documentation name2 'setf stream))
                (terpri stream))

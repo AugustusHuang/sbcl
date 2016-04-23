@@ -307,8 +307,7 @@ If an unsupported TYPE is requested, the function will return NIL.
         (when (and (consp name)
                    (eq (car name) 'setf))
           (setf name (cadr name)))
-        (let ((expander (or (sb-int:info :setf :inverse name)
-                            (sb-int:info :setf :expander name))))
+        (let ((expander (sb-int:info :setf :expander name)))
           (when expander
             (find-definition-source
              (cond ((symbolp expander) (symbol-function expander))
@@ -654,14 +653,14 @@ value."
                ;; Loop through the name/path xref entries in the table
                (loop for i from 0 below (length array) by 2
                      for xref-name = (aref array i)
-                     for xref-path = (aref array (1+ i))
+                     for xref-form-number = (aref array (+ i 1))
                      do (when (equal xref-name wanted-name)
                           (let ((source-location
                                   (find-function-definition-source simple-fun)))
                             ;; Use the more accurate source path from
                             ;; the xref entry.
-                            (setf (definition-source-form-path source-location)
-                                  xref-path)
+                            (setf (definition-source-form-number source-location)
+                                  xref-form-number)
                             (push (cons info-name source-location)
                                   ret)))))))
       (call-with-each-global-functoid

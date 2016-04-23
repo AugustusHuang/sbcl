@@ -123,6 +123,13 @@
           new-name))
   closure)
 
+;;; FIXME: there is no reason to expose two FUN-NAME readers,
+;;; one that works for everything except generic, and one that always works.
+(defun fun-name (x)
+  (if (typep x 'standard-generic-function)
+      (sb!mop:generic-function-name x)
+      (%fun-name x)))
+
 ;;; a SETFable function to return the associated debug name for FUN
 ;;; (i.e., the third value returned from CL:FUNCTION-LAMBDA-EXPRESSION),
 ;;; or NIL if there's none
@@ -226,7 +233,7 @@
   #!+sb-doc
   "Return a string giving the name of the local machine."
   #!+win32 (sb!win32::get-computer-name)
-  #!-win32 (sb!unix:unix-gethostname))
+  #!-win32 (truly-the simple-string (sb!unix:unix-gethostname)))
 
 (defvar *machine-version*)
 

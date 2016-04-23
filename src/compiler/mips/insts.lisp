@@ -21,8 +21,6 @@
             sb!vm::zero
             sb!vm::lip-tn sb!vm::zero-tn)))
 
-(!begin-instruction-definitions)
-
 (setf *assem-scheduler-p* t)
 (setf *assem-max-locations* 68)
 
@@ -141,8 +139,7 @@
   '(:f :un :eq :ueq :olt :ult :ole :ule :sf :ngle :seq :ngl :lt :nge :le :ngt)
   #'equalp)
 
-(defconstant-eqx compare-kinds-vec
-  (apply #'vector compare-kinds)
+(defconstant-eqx compare-kinds-vec #.(apply #'vector compare-kinds)
   #'equalp)
 
 (deftype compare-kind ()
@@ -1045,33 +1042,6 @@
 
 (define-instruction-macro entry-point ()
   nil)
-
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((length (sap-ref-8 sap offset))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer sap)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (cond (length-only
-           (values 0 (1+ length) nil nil))
-          (t
-           (copy-ub8-from-system-area sap (1+ offset) vector 0 length)
-           (collect ((sc-offsets)
-                     (lengths))
-             (lengths 1)                ; the length byte
-             (let* ((index 0)
-                    (error-number (read-var-integer vector index)))
-               (lengths index)
-               (loop
-                 (when (>= index length)
-                   (return))
-                 (let ((old-index index))
-                   (sc-offsets (read-var-integer vector index))
-                   (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
 
 (defmacro break-cases (breaknum &body cases)
   (let ((bn-temp (gensym)))

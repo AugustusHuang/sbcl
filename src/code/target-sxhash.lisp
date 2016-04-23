@@ -173,12 +173,28 @@
 ;; simple cases
 (declaim (ftype (sfunction (integer) hash) sxhash-bignum))
 
+(defun new-instance-hash-code ()
+  ;; ANSI SXHASH wants us to make a good-faith effort to produce
+  ;; hash-codes that are well distributed within the range of
+  ;; non-negative fixnums, and this address-based operation does that.
+  ;; This is faster than calling RANDOM, and is random enough.
+  (loop
+   (let ((answer
+          (truly-the fixnum
+           (quasi-random-address-based-hash
+            (load-time-value (make-array 1 :element-type '(and fixnum unsigned-byte))
+                             t)
+            most-positive-fixnum))))
+     (when (plusp answer)
+       ;; Make sure we never return 0 (almost no chance of that anyway).
+       (return answer)))))
+
 (declaim (inline std-instance-hash))
 (defun std-instance-hash (instance)
   (let ((hash (%instance-ref instance sb!pcl::std-instance-hash-slot-index)))
     (if (not (eql hash 0))
         hash
-        (let ((new (sb!pcl::get-instance-hash-code)))
+        (let ((new (new-instance-hash-code)))
           ;; At most one thread will compute a random hash.
           ;; %INSTANCE-CAS is a full call if there is no vop for it.
           (let ((old (%instance-cas instance sb!pcl::std-instance-hash-slot-index
@@ -369,7 +385,7 @@
       (let ((max-iterations depthoid)
             (depthoid (1- depthoid)))
         ;; We don't mix in LAYOUT here because it was already done above.
-        (do-instance-tagged-slot (i key :layout layout :exclude-padding t)
+        (do-instance-tagged-slot (i key :layout layout :pad nil)
           (mixf result (psxhash (%instance-ref key i) depthoid))
           (if (zerop (decf max-iterations)) (return)))))
     ;; [The following comment blurs some issues: indeed it would take
@@ -452,3 +468,28 @@
                      (mixf result (number-psxhash (realpart key)))
                      (mixf result (number-psxhash (imagpart key)))
                      result))))))
+
+;;; Semantic equivalent of SXHASH, but better-behaved for function names.
+;;; It performs more work by not cutting off as soon in the CDR direction.
+;;; More work here equates to less work in the global hashtable.
+;;; To wit: (eq (sxhash '(foo a b c bar)) (sxhash '(foo a b c d))) => T
+;;; but the corresponding globaldb-sxhashoids differ.
+(defun sb!c::globaldb-sxhashoid (name)
+  (locally
+      (declare (optimize (safety 0))) ; after the argc check
+    ;; TRAVERSE will walk across more cons cells than RECURSE will descend.
+    ;; That's why this isn't just one self-recursive function.
+    (labels ((traverse (accumulator x length-limit)
+               (declare (fixnum length-limit))
+               (cond ((atom x) (mix (sxhash x) accumulator))
+                     ((zerop length-limit) accumulator)
+                     (t (traverse (mix (recurse (car x) 4) accumulator)
+                                  (cdr x) (1- length-limit)))))
+             (recurse (x depthoid) ; depthoid = a blend of level and length
+               (declare (fixnum depthoid))
+               (cond ((atom x) (sxhash x))
+                     ((zerop depthoid)
+                      #.(logand sb!xc:most-positive-fixnum #36Rglobaldbsxhashoid))
+                     (t (mix (recurse (car x) (1- depthoid))
+                             (recurse (cdr x) (1- depthoid)))))))
+      (traverse 0 name 10))))

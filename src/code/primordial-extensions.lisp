@@ -28,49 +28,6 @@
                          bindings)))
      ,@forms))
 
-;;;; target constants which need to appear as early as possible
-
-;;; an internal tag for marking empty slots, which needs to be defined
-;;; as early as possible because it appears in macroexpansions for
-;;; iteration over hash tables
-;;;
-;;; CMU CL 18b used :EMPTY for this purpose, which was somewhat nasty
-;;; since it's easily accessible to the user, so that e.g.
-;;;     (DEFVAR *HT* (MAKE-HASH-TABLE))
-;;;     (SETF (GETHASH :EMPTY *HT*) :EMPTY)
-;;;     (MAPHASH (LAMBDA (K V) (FORMAT T "~&~S ~S~%" K V)))
-;;; gives no output -- oops!
-;;;
-;;; FIXME: It'd probably be good to use the unbound marker for this.
-;;; However, there might be some gotchas involving assumptions by
-;;; e.g. AREF that they're not going to return the unbound marker,
-;;; and there's also the noted-below problem that the C-level code
-;;; contains implicit assumptions about this marker.
-;;;
-;;; KLUDGE: Note that as of version 0.pre7 there's a dependence in the
-;;; gencgc.c code on this value being a symbol. (This is only one of
-;;; several nasty dependencies between that code and this, alas.)
-;;; -- WHN 2001-08-17
-(defconstant +empty-ht-slot+ '%empty-ht-slot%)
-;;; Q: What "mess" should we not need?
-;;; We shouldn't need this mess now that EVAL-WHEN works.
-
-;;; KLUDGE: Using a private symbol still leaves us vulnerable to users
-;;; getting nonconforming behavior by messing around with
-;;; DO-ALL-SYMBOLS. That seems like a fairly obscure problem, so for
-;;; now we just don't worry about it. If for some reason it becomes
-;;; worrisome and the magic value needs replacement:
-;;;   * The replacement value needs to be LOADable with EQL preserved,
-;;;     so that the macroexpansion for WITH-HASH-TABLE-ITERATOR will
-;;;     work when compiled into a file and loaded back into SBCL.
-;;;     (Thus, just uninterning %EMPTY-HT-SLOT% doesn't work.)
-;;;   * The replacement value needs to be acceptable to the
-;;;     low-level gencgc.lisp hash table scavenging code.
-;;;   * The change will break binary compatibility, since comparisons
-;;;     against the value used at the time of compilation are wired
-;;;     into FASL files.
-;;; -- WHN 20000622
-
 ;; Define "exchanged subtract" So that DECF on a symbol requires no LET binding:
 ;;  (DECF I (EXPR)) -> (SETQ I (XSUBTRACT (EXPR) I))
 ;; which meets the CLHS 5.1.3 requirement to eval (EXPR) prior to reading
@@ -102,8 +59,6 @@
 
 ;;; Return a list of N gensyms. (This is a common suboperation in
 ;;; macros and other code-manipulating code.)
-(declaim (ftype (function (unsigned-byte &optional t) (values list &optional))
-                make-gensym-list))
 (defun make-gensym-list (n &optional name)
   (let ((arg (if name (string name) "G")))
     (loop repeat n collect (sb!xc:gensym arg))))
@@ -305,3 +260,14 @@
                       `(let ((it ,it)) (declare (ignorable it)) ,@body)
                       it)
                  (acond ,@rest)))))))
+
+;; This is not an 'extension', but is needed super early, so ....
+(defmacro sb!xc:defconstant (name value &optional (doc nil docp))
+  #!+sb-doc
+  "Define a global constant, saying that the value is constant and may be
+  compiled into code. If the variable already has a value, and this is not
+  EQL to the new value, the code is not portable (undefined behavior). The
+  third argument is an optional documentation string for the variable."
+  `(eval-when (:compile-toplevel :load-toplevel :execute)
+     (sb!c::%defconstant ',name ,value (sb!c:source-location)
+                         ,@(and docp `(',doc)))))

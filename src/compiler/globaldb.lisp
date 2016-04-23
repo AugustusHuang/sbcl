@@ -306,22 +306,6 @@
 (declaim (ftype (sfunction (t) ctype)
                 specifier-type ctype-of sb!kernel::ctype-of-array))
 
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-(defun ftype-from-fdefn (name)
-  (declare (ignorable name))
-  ;; Again [as in (DEFINE-INFO-TYPE (:FUNCTION :TYPE) ...)] it's
-  ;; not clear how to generalize the FBOUNDP expression to the
-  ;; cross-compiler. -- WHN 19990330
-  #+sb-xc-host
-  (specifier-type 'function)
-  #-sb-xc-host
-  (let* ((fdefn (sb!kernel::find-fdefn name))
-         (fun (and fdefn (fdefn-fun fdefn))))
-    (if fun
-        (handler-bind ((style-warning #'muffle-warning))
-          (specifier-type (sb!impl::%fun-type fun)))
-        (specifier-type 'function)))))
-
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition
 (define-info-type (:function :assumed-type)
@@ -568,10 +552,9 @@
 (define-info-type (:alien-type :enum) :type-spec (or alien-type null))
 
 ;;;; ":SETF" subsection - Data pertaining to expansion of the omnipotent macro.
-(define-info-type (:setf :inverse) :type-spec (or symbol null))
 (define-info-type (:setf :documentation) :type-spec (or string null))
 (define-info-type (:setf :expander)
-    :type-spec (or function (cons integer function) null))
+    :type-spec (or symbol function (cons integer function) null))
 
 ;;;; ":CAS" subsection - Like SETF but there are no "inverses", just expanders
 (define-info-type (:cas :expander) :type-spec (or function null))

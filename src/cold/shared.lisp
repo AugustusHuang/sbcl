@@ -23,8 +23,38 @@
 
 (in-package "SB-COLD")
 
+(defun parse-make-host-parallelism (str)
+  (multiple-value-bind (value1 end) (parse-integer str :junk-allowed t)
+    (when value1
+      (let ((value2 (if (and value1
+                             (< end (1- (length str))) ; ~ /,[\d]+/
+                             (eql (char str end) #\,))
+                        (parse-integer str :start (1+ end)))))
+        ;; If only 1 integer, assume same parallelism for both passes.
+        (unless value2
+          (setq value2 value1))
+        ;; 0 means no parallelism. 1 means use at most one subjob,
+        ;; just in case you want to test the controlling loop.
+        (when (eql value1 0) (setq value1 nil))
+        (when (eql value2 0) (setq value2 nil))
+        ;; Parallelism on pass 1 works only if LOAD does not compile.
+        ;; Otherwise it's slower than compiling serially.
+        ;; (And this has only been tested with sb-fasteval, not sb-eval.)
+        (cons (and (find-package "SB-INTERPRETER") value1)
+              value2)))))
+
+(defvar *make-host-parallelism*
+  (or #+sbcl
+      (let ((envvar (sb-ext:posix-getenv "SBCL_MAKE_PARALLEL")))
+        (when envvar
+          (parse-make-host-parallelism envvar)))))
+
+(defun make-host-1-parallelism () (car *make-host-parallelism*))
+(defun make-host-2-parallelism () (cdr *make-host-parallelism*))
+
 ;;; If TRUE, then COMPILE-FILE is being invoked only to process
 ;;; :COMPILE-TOPLEVEL forms, not to produce an output file.
+;;; This is part of the implementation of parallelized make-host-2.
 (defvar *compile-for-effect-only* nil)
 
 ;;; prefixes for filename stems when cross-compiling. These are quite arbitrary
@@ -344,7 +374,11 @@
          ;; -- WHN 19990815
          (src (stem-source-path stem))
          (obj (stem-object-path stem flags mode))
-         (tmp-obj (concatenate 'string obj "-tmp"))
+         ;; Compile-for-effect happens simultaneously with a forked compile,
+         ;; so we need the for-effect output not to stomp on the real output.
+         (tmp-obj
+          (concatenate 'string obj
+                       (if *compile-for-effect-only* "-scratch" "-tmp")))
 
          (compile-file (ecase mode
                          (:host-compile #'compile-file)
@@ -361,7 +395,7 @@
     ;; delete any preexisting object file in order to avoid confusing
     ;; ourselves later should we happen to bail out of compilation
     ;; with an error.
-    (when (probe-file obj)
+    (when (and (not *compile-for-effect-only*) (probe-file obj))
       (delete-file obj))
 
     ;; Original comment:
@@ -432,11 +466,10 @@
 
     ;; If we get to here, compilation succeeded, so it's OK to rename
     ;; the temporary output file to the permanent object file.
-    ;; ASSEMBLE-FILE produces no output in the preload pass.
-    ;; (The compiler produces an empty file.)
-    (if (and *compile-for-effect-only* (search "/assembly/" obj))
-        nil
-        (rename-file-a-la-unix tmp-obj obj))
+    (cond ((not *compile-for-effect-only*)
+           (rename-file-a-la-unix tmp-obj obj))
+          ((probe-file tmp-obj)
+           (delete-file tmp-obj))) ; clean up the trash
 
     ;; nice friendly traditional return value
     (pathname obj)))

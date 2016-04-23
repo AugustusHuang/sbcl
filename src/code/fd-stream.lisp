@@ -178,7 +178,7 @@
 (defun fd-stream-bivalent-p (stream)
   (eq (fd-stream-element-mode stream) :bivalent))
 
-(def!method print-object ((fd-stream fd-stream) stream)
+(defmethod print-object ((fd-stream fd-stream) stream)
   (declare (type stream stream))
   (print-unreadable-object (fd-stream stream :type t :identity t)
     (format stream "for ~S" (fd-stream-name fd-stream))))
@@ -1320,6 +1320,28 @@
            (sap (buffer-sap ibuf)))
       (declare (type index remaining-request head tail available))
       (declare (type index n-this-copy))
+      #!+cheneygc
+      ;; Prevent failure caused by memmove() hitting a write-protected page
+      ;; and the fault handler losing, since it thinks you're not in Lisp.
+      ;; This is wasteful, but better than being randomly broken (lp#1366263).
+      (when (> this-end this-start)
+        (typecase buffer
+          (system-area-pointer
+           (setf (sap-ref-8 buffer this-start) (sap-ref-8 buffer this-start)
+                 (sap-ref-8 buffer (1- this-end)) (sap-ref-8 buffer (1- this-end))))
+          ((simple-array (unsigned-byte 8) (*))
+           (setf (aref buffer this-start) (aref buffer this-start)
+                 (aref buffer (1- this-end)) (aref buffer (1- this-end))))
+          ((simple-array * (*))
+           ;; We might have an array of UNSIGNED-BYTE-32 here, but the
+           ;; bounding indices act as if it were UNSIGNED-BYTE-8.
+           ;; This is strange, and in direct contradiction to what %BYTE-BLT
+           ;; believes it accepts. i.e. according to the comments,
+           ;; it's for want of error checking that this works at all.
+           (with-pinned-objects (buffer)
+             (let ((sap (vector-sap buffer)))
+               (setf (sap-ref-8 sap this-start) (sap-ref-8 sap this-start)
+                     (sap-ref-8 sap (1- this-end)) (sap-ref-8 sap (1- this-end))))))))
       ;; Copy data from stream buffer into user's buffer.
       (%byte-blt sap head buffer this-start this-end)
       (incf (buffer-head ibuf) n-this-copy)
@@ -2322,8 +2344,10 @@
                (if-exists nil if-exists-given)
                (if-does-not-exist nil if-does-not-exist-given)
                (external-format :default)
-               ;; :class is a private option - use it at your own risk
+               ;; private options - use at your own risk
                (class 'fd-stream)
+               #!+win32
+               (overlapped t)
              &aux                       ; Squelch assignment warning.
              (direction direction)
              (if-does-not-exist if-does-not-exist)
@@ -2470,7 +2494,8 @@
           ;; Now we can try the actual Unix open(2).
           (multiple-value-bind (fd errno)
               (if namestring
-                  (sb!unix:unix-open namestring mask mode)
+                  (sb!unix:unix-open namestring mask mode
+                                     #!+win32 :overlapped #!+win32 overlapped)
                   (values nil #!-win32 sb!unix:enoent
                               #!+win32 sb!win32::error_file_not_found))
             (flet ((vanilla-open-error ()
@@ -2586,11 +2611,11 @@
                         (nul-handle
                           (cond
                             ((and inputp outputp)
-                             (sb!win32:unixlike-open nul-name sb!unix:o_rdwr 0))
+                             (sb!win32:unixlike-open nul-name sb!unix:o_rdwr))
                             (inputp
-                             (sb!win32:unixlike-open nul-name sb!unix:o_rdonly 0))
+                             (sb!win32:unixlike-open nul-name sb!unix:o_rdonly))
                             (outputp
-                             (sb!win32:unixlike-open nul-name sb!unix:o_wronly 0))
+                             (sb!win32:unixlike-open nul-name sb!unix:o_wronly))
                             (t
                              ;; Not quite sure what to do in this case.
                              nil))))

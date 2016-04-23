@@ -882,7 +882,7 @@
 
 ;;;; synonym streams
 
-(def!method print-object ((x synonym-stream) stream)
+(defmethod print-object ((x synonym-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream ":SYMBOL ~S" (synonym-stream-symbol x))))
 
@@ -1026,7 +1026,7 @@
 
 (declaim (freeze-type concatenated-stream))
 
-(def!method print-object ((x concatenated-stream) stream)
+(defmethod print-object ((x concatenated-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream
             ":STREAMS ~S"
@@ -1123,7 +1123,7 @@
 
 (declaim (freeze-type echo-stream))
 
-(def!method print-object ((x echo-stream) stream)
+(defmethod print-object ((x echo-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream
             ":INPUT-STREAM ~S :OUTPUT-STREAM ~S"
@@ -1368,7 +1368,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
   (setf (string-output-stream-buffer stream)
         (or (pop (string-output-stream-next stream))
             ;; FIXME: This would be the correct place to detect that
-            ;; more then FIXNUM characters are being written to the
+            ;; more than FIXNUM characters are being written to the
             ;; stream, and do something about it.
             (make-string size))))
 

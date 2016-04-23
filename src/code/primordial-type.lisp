@@ -21,10 +21,8 @@
                       ;; Make it known as a constant in the cross-compiler.
                       (setf (info :variable :kind ',global-sym) :constant))
                (!cold-init-forms
-                #+sb-xc (sb!c::!%quietly-defconstant
-                         ',global-sym
-                         (!fix-ctype-hash ,global-sym)
-                         (sb!c::source-location))
+                #+sb-xc (sb!c::%defconstant ',global-sym ,global-sym
+                                            (sb!c::source-location))
                 (setf (info :type :builtin ',type) ,global-sym
                       (info :type :kind ',type) :primitive)))))
    ;; KLUDGE: In ANSI, * isn't really the name of a type, it's just a
@@ -48,11 +46,6 @@
    ;; extended sequence hierarchy.  (Might be removed later if we use
    ;; a dedicated FUNDAMENTAL-SEQUENCE class for this.)
    (frob extended-sequence *extended-sequence-type*))
-
-;; Unlike the above, this one is not a NAMED-TYPE, and as such
-;; does not have to be a singleton, but it improves efficiency.
-;; (Except that we never really need it for anything)
-(defglobal *universal-fun-type* -1)
 
 ;;; a vector that maps type codes to layouts, used for quickly finding
 ;;; the layouts of built-in classes

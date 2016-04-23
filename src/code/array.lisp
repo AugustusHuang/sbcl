@@ -50,7 +50,8 @@
 (defun check-bound (array bound index)
   (declare (type index bound)
            (fixnum index))
-  (%check-bound array bound index))
+  (%check-bound array bound index)
+  index)
 
 (defun %with-array-data/fp (array start end)
   (%with-array-data-macro array start end :check-bounds t :check-fill-pointer t))
@@ -274,12 +275,11 @@
            (result sb!vm:simple-array-nil-widetag))
           (t
            (block nil
-             (let ((ctype
-                     (handler-case (specifier-type type)
-                       (parse-unknown-type ()
-                         (return (result sb!vm:simple-vector-widetag))))))
+             (let ((ctype (type-or-nil-if-unknown type)))
+               (unless ctype
+                 (return (result sb!vm:simple-vector-widetag)))
                (typecase ctype
-                 (union-type ; FIXME: forward ref
+                 (union-type
                   (let ((types (union-type-types ctype)))
                     (cond ((not (every #'numeric-type-p types))
                            (result sb!vm:simple-vector-widetag))
@@ -296,7 +296,7 @@
                            (result sb!vm:simple-array-long-float-widetag))
                           (t
                            (result sb!vm:simple-vector-widetag)))))
-                 (character-set-type ; FIXME: forward ref
+                 (character-set-type
                   #!-sb-unicode (result sb!vm:simple-base-string-widetag)
                   #!+sb-unicode
                   (if (loop for (start . end)
@@ -363,6 +363,9 @@
                    widetag))))
     (let ((widetag (%other-pointer-widetag array)))
       (make-case))))
+
+(defun make-vector-like (vector length)
+  (allocate-vector-with-widetag (array-underlying-widetag vector) length))
 
 ;; Complain in various ways about wrong :INITIAL-foo arguments,
 ;; returning the two initialization arguments needed for DATA-VECTOR-FROM-INITS.
@@ -603,6 +606,8 @@ of specialized arrays is supported."
 (macrolet ((def (name table-name)
              `(progn
                 (defglobal ,table-name (make-array ,(1+ sb!vm:widetag-mask)))
+                (declaim (type (simple-array function (,(1+ sb!vm:widetag-mask)))
+                               ,table-name))
                 (defmacro ,name (array-var)
                   `(the function
                      (let ((tag 0))
@@ -625,6 +630,7 @@ of specialized arrays is supported."
                          (,end)
                          :check-fill-pointer t)
          (let ((,ref (%find-data-vector-reffer ,vec)))
+           (declare (function ,ref))
            (do ((,index ,start (1+ ,index)))
                ((>= ,index ,end)
                 (let ((,elt nil))
@@ -1061,11 +1067,12 @@ of specialized arrays is supported."
   (declare (explicit-check))
   (flet ((oops (x)
            (fill-pointer-error vector x)))
-    (if (array-has-fill-pointer-p vector)
-        (if (> new (%array-available-elements vector))
-            (oops new)
-            (setf (%array-fill-pointer vector) new))
-        (oops nil))))
+    (cond ((not (array-has-fill-pointer-p vector))
+           (oops nil))
+          ((> new (%array-available-elements vector))
+           (oops new))
+          (t
+            (setf (%array-fill-pointer vector) new)))))
 
 ;;; FIXME: It'd probably make sense to use a MACROLET to share the
 ;;; guts of VECTOR-PUSH between VECTOR-PUSH-EXTEND. Such a macro
@@ -1080,7 +1087,6 @@ of specialized arrays is supported."
    returned."
   (declare (explicit-check))
   (let ((fill-pointer (fill-pointer array)))
-    (declare (fixnum fill-pointer))
     (cond ((= fill-pointer (%array-available-elements array))
            nil)
           (t
@@ -1089,22 +1095,73 @@ of specialized arrays is supported."
            (setf (%array-fill-pointer array) (1+ fill-pointer))
            fill-pointer))))
 
+;;; Widetags of FROM and TO should be equal
+(defun copy-vector-data (from to start end n-bits)
+  (declare (vector from to)
+           (index start end)
+           ((integer 0 255) n-bits))
+  (let ((from-length (length from)))
+    (cond ((simple-vector-p from)
+           (replace (truly-the simple-vector to)
+                    (truly-the simple-vector from)
+                    :start2 start :end2 end))
+          ;; Vector sizes are double-word aligned and have zeros in
+          ;; the extra word so it's safe to copy when the boundaries
+          ;; are matching the whole vector.
+          ;; A more generic routine is left for another time, even if
+          ;; only handling aligned data since it will avoid consing
+          ;; floats or word bignums.
+          ((and (= start 0)
+                (= end from-length))
+           (let ((words (ceiling (* from-length n-bits)
+                                 sb!vm:n-word-bits)))
+             (loop for i below words
+                   do (setf
+                       (%vector-raw-bits to i)
+                       (%vector-raw-bits from i)))))
+          (t
+           (replace to
+                    from
+                    :start2 start :end2 end)))
+    to))
+
+(defun extend-vector (vector min-extension)
+  (declare (optimize speed)
+           (vector vector))
+  (let* ((old-length (length vector))
+         (min-extension (or min-extension
+                            (min old-length
+                                 (- array-dimension-limit old-length))))
+         (new-length (the index (+ old-length
+                                   (max 1 min-extension))))
+         (fill-pointer (1+ old-length)))
+    (declare (fixnum new-length min-extension))
+    (with-array-data ((old-data vector) (old-start)
+                      (old-end old-length))
+      (let* ((widetag (%other-pointer-widetag old-data))
+             (n-bits (aref %%simple-array-n-bits%% widetag))
+             (new-data
+               (allocate-vector-with-widetag widetag new-length n-bits)))
+        (copy-vector-data old-data new-data old-start old-end n-bits)
+        (setf (%array-data-vector vector) new-data
+              (%array-available-elements vector) new-length
+              (%array-fill-pointer vector) fill-pointer
+              (%array-displacement vector) 0
+              (%array-dimension vector 0) new-length
+              (%array-displaced-p vector) nil)
+        vector))))
+
 (defun vector-push-extend (new-element vector &optional min-extension)
-  (declare (type (or null fixnum) min-extension))
+  (declare (type (or null (and index (integer 1))) min-extension))
   (declare (explicit-check))
-  (let ((fill-pointer (fill-pointer vector)))
-    (declare (fixnum fill-pointer))
-    (when (= fill-pointer (%array-available-elements vector))
-      (let ((min-extension
-             (or min-extension
-                 (let ((length (length vector)))
-                   (min (1+ length)
-                        (- array-dimension-limit length))))))
-        (adjust-array vector (+ fill-pointer (max 1 min-extension)))))
+  (let* ((fill-pointer (fill-pointer vector))
+         (new-fill-pointer (1+ fill-pointer)))
+    (if (= fill-pointer (%array-available-elements vector))
+        (extend-vector vector min-extension)
+        (setf (%array-fill-pointer vector) new-fill-pointer))
     ;; disable bounds checking
     (locally (declare (optimize (safety 0)))
       (setf (aref vector fill-pointer) new-element))
-    (setf (%array-fill-pointer vector) (1+ fill-pointer))
     fill-pointer))
 
 (defun vector-pop (array)
@@ -1113,7 +1170,6 @@ of specialized arrays is supported."
   new fill pointer."
   (declare (explicit-check))
   (let ((fill-pointer (fill-pointer array)))
-    (declare (fixnum fill-pointer))
     (if (zerop fill-pointer)
         (error "There is nothing left to pop.")
         ;; disable bounds checking (and any fixnum test)
@@ -1165,17 +1221,18 @@ of specialized arrays is supported."
                     (array-data (data-vector-from-inits
                                  dimensions array-size element-type nil nil
                                  initialize initial-data)))
-               (if (adjustable-array-p array)
-                   (set-array-header array array-data array-size
-                                 (get-new-fill-pointer array array-size
-                                                       fill-pointer)
-                                 0 dimensions nil nil)
-                   (if (array-header-p array)
-                       ;; simple multidimensional or single dimensional array
+               (cond ((adjustable-array-p array)
+                      (set-array-header array array-data array-size
+                                        (get-new-fill-pointer array array-size
+                                                              fill-pointer)
+                                        0 dimensions nil nil))
+                     ((array-header-p array)
+                      ;; simple multidimensional or single dimensional array
                        (make-array dimensions
                                    :element-type element-type
-                                   :initial-contents initial-contents)
-                       array-data))))
+                                   :initial-contents initial-contents))
+                     (t
+                      array-data))))
           (displaced-to
              ;; We already established that no INITIAL-CONTENTS was supplied.
              (unless (or (eql element-type (array-element-type displaced-to))
@@ -1231,58 +1288,60 @@ of specialized arrays is supported."
                                        0 dimensions nil nil)
                      new-data))))
           (t
-             (let ((old-length (%array-available-elements array))
-                   (new-length (apply #'* dimensions)))
-               (declare (fixnum old-length new-length))
-               (with-array-data ((old-data array) (old-start)
-                                 (old-end old-length))
-                 (declare (ignore old-end))
-                 (let ((new-data (if (or (and (array-header-p array)
-                                              (%array-displaced-p array))
-                                         (> new-length old-length)
-                                         (not (adjustable-array-p array)))
-                                     (data-vector-from-inits
-                                      dimensions new-length
-                                      element-type
-                                      (%other-pointer-widetag old-data) nil
-                                      (if initial-element-p :initial-element)
-                                      initial-element)
-                                     old-data)))
-                   (if (or (zerop old-length) (zerop new-length))
-                       (when initial-element-p (fill new-data initial-element))
-                       (zap-array-data old-data (array-dimensions array)
-                                       old-start
-                                       new-data dimensions new-length
-                                       element-type initial-element
-                                       initial-element-p))
-                   (if (adjustable-array-p array)
-                       (set-array-header array new-data new-length
-                                         nil 0 dimensions nil nil)
-                       (let ((new-array
-                              (make-array-header
-                               sb!vm:simple-array-widetag array-rank)))
-                         (set-array-header new-array new-data new-length
-                                           nil 0 dimensions nil t))))))))))
+           (let ((old-length (%array-available-elements array))
+                 (new-length (apply #'* dimensions)))
+             (declare (fixnum old-length new-length))
+             (with-array-data ((old-data array) (old-start)
+                               (old-end old-length))
+               (declare (ignore old-end))
+               (let ((new-data (if (or (and (array-header-p array)
+                                            (%array-displaced-p array))
+                                       (> new-length old-length)
+                                       (not (adjustable-array-p array)))
+                                   (data-vector-from-inits
+                                    dimensions new-length
+                                    element-type
+                                    (%other-pointer-widetag old-data) nil
+                                    (if initial-element-p :initial-element)
+                                    initial-element)
+                                   old-data)))
+                 (if (or (zerop old-length) (zerop new-length))
+                     (when initial-element-p (fill new-data initial-element))
+                     (zap-array-data old-data (array-dimensions array)
+                                     old-start
+                                     new-data dimensions new-length
+                                     element-type initial-element
+                                     initial-element-p))
+                 (if (adjustable-array-p array)
+                     (set-array-header array new-data new-length
+                                       nil 0 dimensions nil nil)
+                     (let ((new-array
+                             (make-array-header
+                              sb!vm:simple-array-widetag array-rank)))
+                       (set-array-header new-array new-data new-length
+                                         nil 0 dimensions nil t))))))))))
 
 
 (defun get-new-fill-pointer (old-array new-array-size fill-pointer)
-  (cond ((not fill-pointer)
-         ;; "The consequences are unspecified if array is adjusted to a
-         ;;  size smaller than its fill pointer ..."
-         (when (array-has-fill-pointer-p old-array)
-           (when (> (%array-fill-pointer old-array) new-array-size)
-             (error "cannot ADJUST-ARRAY an array (~S) to a size (~S) that is ~
+  (declare (fixnum new-array-size))
+  (typecase fill-pointer
+    (null
+     ;; "The consequences are unspecified if array is adjusted to a
+     ;;  size smaller than its fill pointer ..."
+     (when (array-has-fill-pointer-p old-array)
+       (when (> (%array-fill-pointer old-array) new-array-size)
+         (error "cannot ADJUST-ARRAY an array (~S) to a size (~S) that is ~
                      smaller than its fill pointer (~S)"
-                    old-array new-array-size (fill-pointer old-array)))
-           (%array-fill-pointer old-array)))
-        ((numberp fill-pointer)
-         (when (> fill-pointer new-array-size)
-           (error "can't supply a value for :FILL-POINTER (~S) that is larger ~
+                old-array new-array-size (fill-pointer old-array)))
+       (%array-fill-pointer old-array)))
+    ((eql t)
+     new-array-size)
+    (fixnum
+     (when (> fill-pointer new-array-size)
+       (error "can't supply a value for :FILL-POINTER (~S) that is larger ~
                    than the new length of the vector (~S)"
-                  fill-pointer new-array-size))
-         fill-pointer)
-        ((eq fill-pointer t)
-         new-array-size)))
+              fill-pointer new-array-size))
+     fill-pointer)))
 
 ;;; Destructively alter VECTOR, changing its length to NEW-LENGTH,
 ;;; which must be less than or equal to its current length. This can
@@ -1405,8 +1464,7 @@ of specialized arrays is supported."
     array))
 
 ;;; User visible extension
-(declaim (ftype (function (array) (values (simple-array * (*)) &optional))
-                array-storage-vector))
+(declaim (ftype (sfunction (array) (simple-array * (*))) array-storage-vector))
 (defun array-storage-vector (array)
   #!+sb-doc
   "Returns the underlying storage vector of ARRAY, which must be a non-displaced array.
@@ -1422,12 +1480,13 @@ function to be removed without further warning."
   ;; KLUDGE: Without TRULY-THE the system is not smart enough to figure out that
   ;; the return value is always of the known type.
   (truly-the (simple-array * (*))
-             (if (array-header-p array)
-                 (if (%array-displaced-p array)
-                     (error "~S cannot be used with displaced arrays. Use ~S instead."
-                            'array-storage-vector 'array-displacement)
-                     (%array-data-vector array))
-                 array)))
+             (cond ((not (array-header-p array))
+                    array)
+                   ((%array-displaced-p array)
+                    (error "~S cannot be used with displaced arrays. Use ~S instead."
+                           'array-storage-vector 'array-displacement))
+                   (t
+                    (%array-data-vector array)))))
 
 
 ;;;; ZAP-ARRAY-DATA for ADJUST-ARRAY
@@ -1450,12 +1509,12 @@ function to be removed without further warning."
          ;; INITIAL-ELEMENT-P are used when OLD-DATA and NEW-DATA are
          ;; EQ; in this case, a temporary must be used and filled
          ;; appropriately. specified initial-element.
-         (when initial-element-p
-           ;; FIXME: transforming this TYPEP to someting a bit faster
-           ;; would be a win...
-           (unless (typep initial-element element-type)
-             (error "~S can't be used to initialize an array of type ~S."
-                    initial-element element-type)))
+         ;; FIXME: transforming this TYPEP to someting a bit faster
+         ;; would be a win...
+         (unless (or (not initial-element-p)
+                     (typep initial-element element-type))
+           (error "~S can't be used to initialize an array of type ~S."
+                  initial-element element-type))
          (let ((temp (if initial-element-p
                          (make-array new-length :initial-element initial-element)
                          (make-array new-length))))

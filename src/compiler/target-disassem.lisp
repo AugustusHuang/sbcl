@@ -763,7 +763,10 @@
       (awhen (get symbol 'instruction-flavors)
         (setf (get symbol 'instruction-flavors)
               (collect-inst-variants
-               (string-upcase symbol) package it cache))))))
+               (string-upcase symbol) package it cache))))
+    (apply 'format t
+           "~&Disassembler: ~D printers, ~D prefilters, ~D labelers~%"
+           (mapcar (lambda (x) (length (cdr x))) cache))))
 
 ;;; Get the instruction-space, creating it if necessary.
 (defun get-inst-space (&key (package sb!assem::*backend-instruction-set-package*)
@@ -2106,6 +2109,36 @@
     (incf (dstate-next-offs dstate)
           adjust)))
 
+;;; arm64 stores an error-number in the instruction bytes,
+;;; so can't easily share this code.
+;;; But probably we should just add the conditionalization in here.
+#!-arm64
+(defun snarf-error-junk (sap offset &optional length-only)
+  (let ((length (sb!sys:sap-ref-8 sap offset)))
+    (declare (type sb!sys:system-area-pointer sap)
+             (type (unsigned-byte 8) length))
+    (if length-only
+        (values 0 (1+ length) nil nil)
+        (let ((vector
+               (truly-the (simple-array (unsigned-byte 8) (*))
+                          (sb!sys:sap-ref-octets sap (1+ offset) length))))
+           (collect ((sc-offsets)
+                     (lengths))
+             (lengths 1)                ; the length byte
+             (let* ((index 0)
+                    (error-number (sb!c:read-var-integer vector index)))
+               (lengths index)
+               (loop
+                 (when (>= index length)
+                   (return))
+                 (let ((old-index index))
+                   (sc-offsets (sb!c:read-var-integer vector index))
+                   (lengths (- index old-index))))
+               (values error-number
+                       (1+ length)
+                       (sc-offsets)
+                       (lengths))))))))
+
 ;; A prefilter set is a list of vectors specifying bytes to extract
 ;; and a function to call on the extracted value(s).
 ;; EQUALP lists of vectors can be coalesced, since they're immutable.
@@ -2153,12 +2186,11 @@
                compare-fields-form compile-inst-printer compile-print
                compile-printer-body compile-printer-list compile-test
                correct-dchunk-bytespec-for-endianness
-               define-arg-type define-instruction-format equal-mod-gensyms
+               define-arg-type define-instruction-format
                find-first-field-name find-printer-fun format-or-lose
                gen-arg-forms make-arg-temp-bindings make-funstate massage-arg
                maybe-listify modify-arg pd-error pick-printer-choice
                preprocess-chooses preprocess-conditionals preprocess-printer
-               preprocess-test sharing-cons sharing-mapcar
-               string-or-qsym-p strip-quote))
+               preprocess-test sharing-cons sharing-mapcar))
     (fmakunbound s)
     (unintern s 'sb-disassem)))

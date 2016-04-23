@@ -170,29 +170,18 @@
       (let ((ptr (+ ptr n-data-words)))
         (declare (type index ptr))
         (setf (%instance-layout res) layout)
-        #!-interleaved-raw-slots
-        (let* ((nuntagged (layout-n-untagged-slots layout))
-               (ntagged (- size nuntagged)))
-          (dotimes (n (1- ntagged))
-            (declare (type index n))
-            (setf (%instance-ref res (1+ n)) (fop-stack-ref (decf ptr))))
-          (dotimes (n nuntagged)
-            (declare (type index n))
-            (setf (%raw-instance-ref/word res (- nuntagged n 1))
-                  (fop-stack-ref (decf ptr)))))
-        #!+interleaved-raw-slots
-        (let ((metadata (layout-untagged-bitmap layout)))
+        (let ((bitmap (layout-bitmap layout)))
           (do ((i sb!vm:instance-data-start (1+ i)))
               ((>= i size))
             (declare (type index i))
             (let ((val (fop-stack-ref (decf ptr))))
-              (if (logbitp i metadata)
+              (if (logbitp i bitmap)
                   (setf (%raw-instance-ref/word res i) val)
                   (setf (%instance-ref res i) val)))))))
     res))
 
-(!define-fop 45 (fop-layout (name inherits depthoid length metadata))
-  (find-and-init-or-check-layout name length inherits depthoid metadata))
+(!define-fop 45 (fop-layout (name inherits depthoid length bitmap))
+  (find-and-init-or-check-layout name length inherits depthoid bitmap))
 
 ;; Allocate a CLOS object. This is used when the compiler detects that
 ;; MAKE-LOAD-FORM returned a simple use of MAKE-LOAD-FORM-SAVING-SLOTS,

@@ -23,8 +23,6 @@
             sb!vm::frame-byte-offset
             sb!vm::registers sb!vm::float-registers sb!vm::stack))) ; SB names
 
-(!begin-instruction-definitions)
-
 ;;; Note: In CMU CL, this used to be a call to SET-DISASSEM-PARAMS.
 (setf *disassem-inst-alignment-bytes* 1)
 
@@ -40,12 +38,12 @@
 
 ;;; Default word size for the chip: if the operand size /= :dword
 ;;; we need to output #x66 (or REX) prefix
-(def!constant +default-operand-size+ :dword)
+(defconstant +default-operand-size+ :dword)
 
 ;;; The default address size for the chip. It could be overwritten
 ;;; to :dword with a #x67 prefix, but this is never needed by SBCL
 ;;; and thus not supported by this assembler/disassembler.
-(def!constant +default-address-size+ :qword)
+(defconstant +default-address-size+ :qword)
 
 (defun offset-next (value dstate)
   (declare (type integer value)
@@ -268,7 +266,10 @@
                (let ((width (width-bits (inst-operand-size dstate))))
                  (when (= width 64)
                    (setf width 32))
-                 (read-signed-suffix width dstate))))
+                 (read-signed-suffix width dstate)))
+  :printer (lambda (value stream dstate)
+             (maybe-note-static-symbol value dstate)
+             (princ value stream)))
 
 (define-arg-type signed-imm-data/asm-routine
   :type 'signed-imm-data
@@ -1134,7 +1135,7 @@
   (index nil :type (or tn null))
   (scale 1 :type (member 1 2 4 8))
   (disp 0 :type (or (unsigned-byte 32) (signed-byte 32) fixup)))
-(def!method print-object ((ea ea) stream)
+(defmethod print-object ((ea ea) stream)
   (cond ((or *print-escape* *print-readably*)
          (print-unreadable-object (ea stream :type t)
            (format stream
@@ -1196,16 +1197,25 @@
                                              (- (+ offset posn)))))))
   (values))
 
+(defun emit-byte-displacement-backpatch (segment target)
+  (emit-back-patch segment 1
+                   (lambda (segment posn)
+                     (emit-byte segment
+                                (the (signed-byte 8)
+                                  (- (label-position target) (1+ posn)))))))
+
+(defun emit-dword-displacement-backpatch (segment target &optional (n-extra 0))
+  ;; N-EXTRA is how many more instruction bytes will follow, to properly compute
+  ;; the displacement from the beginning of the next instruction to TARGET.
+  (emit-back-patch segment 4
+                   (lambda (segment posn)
+                     (emit-signed-dword segment (- (label-position target)
+                                                   (+ 4 posn n-extra))))))
+
 (defun emit-label-rip (segment fixup reg remaining-bytes)
-  (let ((label (fixup-offset fixup)))
-    ;; RIP-relative addressing
-    (emit-mod-reg-r/m-byte segment #b00 reg #b101)
-    (emit-back-patch segment
-                     4
-                     (lambda (segment posn)
-                       (emit-signed-dword segment
-                                          (- (label-position label)
-                                             (+ posn 4 remaining-bytes))))))
+  ;; RIP-relative addressing
+  (emit-mod-reg-r/m-byte segment #b00 reg #b101)
+  (emit-dword-displacement-backpatch segment (fixup-offset fixup) remaining-bytes)
   (values))
 
 (defun emit-ea (segment thing reg &key allow-constants (remaining-bytes 0))
@@ -1352,7 +1362,7 @@
 
 ;;;; utilities
 
-(def!constant +operand-size-prefix-byte+ #b01100110)
+(defconstant +operand-size-prefix-byte+ #b01100110)
 
 (defun maybe-emit-operand-size-prefix (segment size)
   (unless (or (eq size :byte)
@@ -2459,12 +2469,7 @@
    (typecase where
      (label
       (emit-byte segment #b11101000) ; 32 bit relative
-      (emit-back-patch segment
-                       4
-                       (lambda (segment posn)
-                         (emit-signed-dword segment
-                                            (- (label-position where)
-                                               (+ posn 4))))))
+      (emit-dword-displacement-backpatch segment where))
      (fixup
       ;; There is no CALL rel64...
       (error "Cannot CALL a fixup: ~S" where))
@@ -2472,14 +2477,6 @@
       (maybe-emit-rex-for-ea segment where nil :operand-size :do-not-set)
       (emit-byte segment #b11111111)
       (emit-ea segment where #b010)))))
-
-(defun emit-byte-displacement-backpatch (segment target)
-  (emit-back-patch segment
-                   1
-                   (lambda (segment posn)
-                     (let ((disp (- (label-position target) (1+ posn))))
-                       (aver (<= -128 disp 127))
-                       (emit-byte segment disp)))))
 
 (define-instruction jmp (segment cond &optional where)
   ;; conditional jumps
@@ -3510,6 +3507,60 @@
   (:emitter
    (emit-byte segment #b00001111)
    (emit-byte segment #b00110001)))
+
+;;;; Intel TSX - some user library (STMX) used to define these,
+;;;; but it's not really supported and they actually belong here.
+
+(define-instruction-format
+    (xbegin 48 :default-printer '(:name :tab label))
+  (op :fields (list (byte 8 0) (byte 8 8)) :value '(#xc7 #xf8))
+  (label :field (byte 32 16) :type 'displacement))
+
+(define-instruction-format
+    (xabort 24 :default-printer '(:name :tab imm))
+  (op :fields (list (byte 8 0) (byte 8 8)) :value '(#xc6 #xf8))
+  (imm :field (byte 8 16)))
+
+(define-instruction xbegin (segment &optional where)
+  (:printer xbegin ())
+  (:emitter
+   (emit-byte segment #xc7)
+   (emit-byte segment #xf8)
+   (if where
+       ;; emit 32-bit, signed relative offset for where
+       (emit-dword-displacement-backpatch segment where)
+       ;; nowhere to jump: simply jump to the next instruction
+       (emit-skip segment 4 0))))
+
+(define-instruction xend (segment)
+  (:printer three-bytes ((op '(#x0f #x01 #xd5))))
+  (:emitter
+   (emit-byte segment #x0f)
+   (emit-byte segment #x01)
+   (emit-byte segment #xd5)))
+
+(define-instruction xabort (segment reason)
+  (:printer xabort ())
+  (:emitter
+   (aver (<= 0 reason #xff))
+   (emit-byte segment #xc6)
+   (emit-byte segment #xf8)
+   (emit-byte segment reason)))
+
+(define-instruction xtest (segment)
+  (:printer three-bytes ((op '(#x0f #x01 #xd6))))
+  (:emitter
+   (emit-byte segment #x0f)
+   (emit-byte segment #x01)
+   (emit-byte segment #xd6)))
+
+(define-instruction xacquire (segment) ;; same prefix byte as repne/repnz
+  (:emitter
+   (emit-byte segment #xf2)))
+
+(define-instruction xrelease (segment) ;; same prefix byte as rep/repe/repz
+  (:emitter
+   (emit-byte segment #xf3)))
 
 ;;;; Late VM definitions
 

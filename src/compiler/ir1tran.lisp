@@ -373,8 +373,7 @@
                     ;; user-defined MAKE-LOAD-FORM methods?
                     (when (emit-make-load-form value)
                       #+sb-xc-host
-                      (aver (zerop (layout-raw-slot-metadata
-                                    (%instance-layout value))))
+                      (aver (zerop (layout-bitmap (%instance-layout value))))
                       (do-instance-tagged-slot (i value)
                         (grovel (%instance-ref value i)))))
                    ;; The cross-compiler can dump certain instances that are not
@@ -683,7 +682,7 @@
     (:always-bound t)
     ;; Compiling to fasl considers a symbol always-bound if its
     ;; :always-bound info value is now T or will eventually be T.
-    (:eventually (fasl-output-p *compile-object*))))
+    (:eventually (producing-fasl-file))))
 
 ;;; Convert a reference to a symbolic constant or variable. If the
 ;;; symbol is entered in the LEXENV-VARS we use that definition,
@@ -950,6 +949,18 @@
 
 
 ;;;; code coverage
+
+;;; Used as the CDR of the code coverage instrumentation records
+;;; (instead of NIL) to ensure that any well-behaving user code will
+;;; not have constants EQUAL to that record. This avoids problems with
+;;; the records getting coalesced with non-record conses, which then
+;;; get mutated when the instrumentation runs. Note that it's
+;;; important for multiple records for the same location to be
+;;; coalesced. -- JES, 2008-01-02
+;;; Use of #. mandates :COMPILE-TOPLEVEL for several Lisps
+;;; even though for us it's immediately accessible to EVAL.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%))
 
 ;;; Check the policy for whether we should generate code coverage
 ;;; instrumentation. If not, just return the original START

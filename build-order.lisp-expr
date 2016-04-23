@@ -42,7 +42,11 @@
 
  ;; This comes early because it's useful for debugging everywhere.
  ("src/code/show")
+ ("src/compiler/early-constantp")
  ("src/code/defsetfs" :not-host)
+
+ ;; Declare all target special variables defined by ANSI
+ ("src/code/cl-specials" :not-host)
 
  ;; Things like DX-FLET and AWHEN are available for use in both the host
  ;; and target very early, with no DEF! obfuscation necessary.
@@ -70,6 +74,7 @@
  ("src/code/globals" :not-host)
 
  ("src/code/cmacros" :not-host :slam-forcibly)
+ ("src/code/early-defmethod" :not-host)
 
  ("src/code/cold-init-helper-macros")
 
@@ -92,16 +97,14 @@
  ;;; stuff needed early both in cross-compilation host and in target Lisp
 
  ("src/code/uncross")
- ("src/code/early-defbangmethod")
 
  ("src/code/defbangtype")
- ("src/code/defbangmacro")
  ("src/code/defbangconstant")
  ("src/code/early-constants") ; needs DEF!CONSTANT
 
+ ("src/compiler/deftype")      ; on host for SB!XC:DEFTYPE
  ("src/compiler/early-lexenv")
  ("src/compiler/early-globaldb")
- ("src/compiler/early-constantp")
 
  ;; comes early so that stuff can reason about function names
  ("src/code/function-names")
@@ -130,9 +133,7 @@
  ("src/code/condition-boot" :not-host)
  ("src/code/early-extensions") ; on host for COLLECT, SYMBOLICATE, etc.
  ("src/compiler/parse-lambda-list")
- ("src/compiler/deftype")      ; on host for SB!XC:DEFTYPE
  ("src/code/restart" :not-host) ; %DEFCONSTANT can bind a restart
- ("src/code/early-alieneval")  ; for funs and vars needed at build and run time
 
  ("src/code/specializable-array")
 
@@ -160,15 +161,17 @@
 
  ("src/compiler/defconstant")
 
- ("src/code/early-defstructs" :not-host) ; gotta-be-first DEFSTRUCTs
  ("src/code/early-raw-slots")
 
  ("src/code/funutils" :not-host)
 
+ ("src/code/maphash" :not-host :slam-forcibly)
+ ("src/code/xset") ; for representation of MEMBER type
  ;; This needs DEF!STRUCT, and is itself needed early so that structure
  ;; accessors and inline functions defined here can be compiled inline
  ;; later. (Avoiding full calls increases efficiency)
  ("src/code/type-class")
+ ("src/code/early-alieneval")  ; for funs and vars needed at build and run time
 
  ("src/code/cas" :not-host)
  ("src/compiler/early-c")
@@ -176,9 +179,11 @@
  ("src/pcl/slot-name") ; for calls from 'info-vector'
  ;; 'info-vector' is needed at least as early as 'fdefinition' so that the
  ;; inlined INFO-VECTOR-FDEFINITION is available to %COERCE-CALLABLE-TO-FUN.
+ ("src/code/signal" :not-host)
  ("src/compiler/info-vector")
  ("src/compiler/globaldb")
  ("src/code/primordial-type")
+ ("src/code/early-classoid")
 
  ("src/code/sysmacs" :not-host)
 
@@ -197,7 +202,6 @@
  ("src/code/cold-error"  :not-host)
  ("src/code/fdefinition" :not-host)
 
- ("src/code/maphash" :not-host :slam-forcibly)
  ("src/code/pred" :not-host)
 
  ("src/compiler/generic/vm-array")
@@ -276,7 +280,6 @@
  ("src/code/fd-stream"     :not-host)
  ("src/code/stream"        :not-host)
  ("src/code/symbol"        :not-host) ; uses STRING-OUTPUT-STREAM
- ("src/code/print"         :not-host)
  ("src/code/early-format")
  ("src/code/defpackage"    :not-host)
 
@@ -291,8 +294,6 @@
  ("src/code/sort"  :not-host)
  ("src/code/time"  :not-host)
  ("src/code/final" :not-host)
-
- ("src/code/setf-funs" :not-host)
 
  ("src/code/stubs" :not-host)
 
@@ -309,7 +310,6 @@
  ("src/compiler/macros")
 
  ("src/compiler/constantp")
- ("src/code/early-classoid")
  ("src/compiler/info-functions")
 
  ("src/compiler/generic/vm-macs")
@@ -317,7 +317,6 @@
 
  ;; needed by "compiler/vop"
  ("src/compiler/sset")
- ("src/code/xset") ; for representation of MEMBER type
  ("src/code/early-type")
 
  ;; for e.g. BLOCK-ANNOTATION, needed by "compiler/vop"
@@ -344,7 +343,7 @@
 
  ("src/code/force-delayed-defbangconstants")
  ("src/code/defmacro")
- ("src/code/force-delayed-defbangmacros")
+ ("src/code/destructuring-bind")
 
  ;; for e.g. !DEF-PRIMITIVE-TYPE, needed by primtype.lisp, and
  ;; DEFINE-STORAGE-CLASS, needed by target/vm.lisp
@@ -440,8 +439,6 @@
 
  ("src/compiler/compiler-error")
 
- ("src/code/late-deftypes-for-target")
-
  ("src/code/type-init")
  ;; Now that the type system is initialized, fix up UNKNOWN types that
  ;; have crept in.
@@ -453,8 +450,6 @@
  ("src/code/hash-table")
  ("src/code/readtable")
  ("src/code/pathname")
- ("src/code/host-pprint")
- ("src/code/pprint" :not-host)
 
  ;; KLUDGE: Much stuff above here is the type system and/or the INFO
  ;; system, not really the compiler proper. It might be easier to
@@ -663,6 +658,9 @@
  ("src/code/bignum-random"     :not-host) ; needs "code/random" and
                                           ;   "code/bignum"
  ("src/code/target-hash-table" :not-host) ; needs "code/hash-table"
+ ("src/code/host-pprint") ; defines QUEUED-OP needed by 'pprint'
+ ("src/code/pprint" :not-host) ; defines WITH-PRETTY-STREAM needed by 'print'
+ ("src/code/print" :not-host)
  ("src/code/reader"            :not-host) ; needs "code/readtable"
  ("src/code/target-stream"     :not-host) ; needs WHITESPACEP from "code/reader"
  ("src/code/target-pathname"   :not-host) ; needs "code/pathname"
@@ -741,12 +739,6 @@
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; target macros and DECLAIMs installed at build-the-cross-compiler time
 
- ;; Declare all target special variables defined by ANSI now, so that
- ;; we don't have to worry about any of them being bound incorrectly
- ;; when the compiler processes code which appears before the appropriate
- ;; DEFVAR or DEFPARAMETER.
- ("src/code/cl-specials")
-
  ;; FIXME: here? earlier?  can probably be as late as possible.  Also
  ;; maybe call it FORCE-DELAYED-PROCLAIMS?
  ("src/compiler/late-proclaim")
@@ -754,7 +746,6 @@
  ;; fundamental target macros (e.g. CL:DO and CL:DEFUN) and support
  ;; for them
  ("src/code/defboot")
- ("src/code/destructuring-bind")
  ("src/code/setf")
  ("src/code/macros")
  ("src/code/loop")
@@ -765,8 +756,6 @@
 
  ("src/code/late-format") ; needs SB!XC:DEFMACRO
  ("src/code/sxhash") ; needs SB!XC:DEFINE-MODIFY-MACRO
- ("src/code/signal")
- ("src/code/late-defbangmethod")
  ("src/code/late-cas" :not-host)
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

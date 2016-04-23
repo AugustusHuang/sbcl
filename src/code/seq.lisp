@@ -182,7 +182,7 @@
   "Return a sequence of the same type as SEQUENCE and the given LENGTH."
   `(seq-dispatch ,sequence
      (make-list ,length)
-     (make-array ,length :element-type (array-element-type ,sequence))
+     (make-vector-like ,sequence ,length)
      (sb!sequence:make-sequence-like ,sequence ,length)))
 
 (sb!xc:defmacro bad-sequence-type-error (type-spec)
@@ -220,6 +220,29 @@
   `(error 'simple-program-error
           :format-control "~S is too hairy for sequence functions."
           :format-arguments (list ,type-spec)))
+
+(sb!xc:defmacro when-extended-sequence-type
+    ((type-specifier type
+      &key
+      expandedp
+      (expanded (gensym "EXPANDED"))
+      (class (gensym "CLASS"))
+      (prototype (gensym "PROTOTYPE") prototypep))
+     &body body)
+  (once-only ((type-specifier type-specifier) (type type))
+    `(when (csubtypep ,type (specifier-type 'sequence))
+       (binding* ((,expanded ,(if expandedp
+                                  type-specifier
+                                  `(typexpand ,type-specifier)))
+                  (,class (if (typep ,expanded 'class)
+                              ,expanded
+                              (find-class ,expanded nil))
+                          :exit-if-null)
+                  (,prototype (sb!mop:class-prototype
+                               (sb!pcl:ensure-class-finalized ,class))))
+         ,@(unless prototypep `((ignore ,prototype)))
+         ,@body))))
+
 ) ; EVAL-WHEN
 
 (defun is-a-valid-sequence-type-specifier-p (type)
@@ -343,12 +366,12 @@
                 (length sequence)
                 (sb!sequence:length sequence)))
 
-(defun make-sequence (type length &key (initial-element nil iep))
+(defun make-sequence (result-type length &key (initial-element nil iep))
   #!+sb-doc
-  "Return a sequence of the given TYPE and LENGTH, with elements initialized
-  to INITIAL-ELEMENT."
+  "Return a sequence of the given RESULT-TYPE and LENGTH, with
+  elements initialized to INITIAL-ELEMENT."
   (declare (index length) (explicit-check))
-  (let* ((expanded-type (typexpand type))
+  (let* ((expanded-type (typexpand result-type))
          (adjusted-type
           (typecase expanded-type
             (atom (cond
@@ -393,32 +416,29 @@
            (cond
              (;; is it immediately obvious what the result type is?
               (typep type 'array-type)
-              (progn
-                (aver (= (length (array-type-dimensions type)) 1))
-                (let* ((etype (type-specifier
-                               (array-type-specialized-element-type type)))
-                       (etype (if (eq etype '*) t etype))
-                       (type-length (car (array-type-dimensions type))))
-                  (unless (or (eq type-length '*)
-                              (= type-length length))
-                    (sequence-type-length-mismatch-error type length))
-                  (if iep
-                      (make-array length :element-type etype
-                                  :initial-element initial-element)
-                      (make-array length :element-type etype)))))
+              (aver (= (length (array-type-dimensions type)) 1))
+              (let* ((etype (type-specifier
+                             (array-type-specialized-element-type type)))
+                     (etype (if (eq etype '*) t etype))
+                     (type-length (car (array-type-dimensions type))))
+                (unless (or (eq type-length '*)
+                            (= type-length length))
+                  (sequence-type-length-mismatch-error type length))
+                (if iep
+                    (make-array length :element-type etype
+                                :initial-element initial-element)
+                    (make-array length :element-type etype))))
              (t (sequence-type-too-hairy (type-specifier type)))))
-          ((and (csubtypep type (specifier-type 'sequence))
-                (awhen (find-class adjusted-type nil)
-                  (let ((prototype (sb!mop:class-prototype
-                                    (sb!pcl:ensure-class-finalized it))))
-                   ;; This function has the EXPLICIT-CHECK declaration,
-                   ;; so we manually assert that it returns a SEQUENCE.
-                   (the sequence
-                    (if iep
-                        (sb!sequence:make-sequence-like
-                         prototype length :initial-element initial-element)
-                        (sb!sequence:make-sequence-like
-                         prototype length)))))))
+          ((when-extended-sequence-type
+               (expanded-type type :expandedp t :prototype prototype)
+             ;; This function has the EXPLICIT-CHECK declaration, so
+             ;; we manually assert that it returns a SEQUENCE.
+             (the extended-sequence
+                  (if iep
+                      (sb!sequence:make-sequence-like
+                       prototype length :initial-element initial-element)
+                      (sb!sequence:make-sequence-like
+                       prototype length)))))
           (t (bad-sequence-type-error (type-specifier type))))))
 
 ;;;; SUBSEQ
@@ -745,34 +765,13 @@ many elements are copied."
       (apply #'sb!sequence:replace sequence1 sequence2 args))))
 
 ;;;; REVERSE
-
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro vector-reverse (sequence)
-  `(let ((length (length ,sequence)))
-     (declare (fixnum length))
-     (do ((forward-index 0 (1+ forward-index))
-          (backward-index (1- length) (1- backward-index))
-          (new-sequence (%make-sequence-like sequence length)))
-         ((= forward-index length) new-sequence)
-       (declare (fixnum forward-index backward-index))
-       (setf (aref new-sequence forward-index)
-             (aref ,sequence backward-index)))))
-
-(sb!xc:defmacro list-reverse-macro (sequence)
-  `(do ((new-list ()))
-       ((endp ,sequence) new-list)
-     (push (pop ,sequence) new-list)))
-
-) ; EVAL-WHEN
-
 (defun reverse (sequence)
   #!+sb-doc
   "Return a new sequence containing the same elements but in reverse order."
   (declare (explicit-check))
   (seq-dispatch-checking sequence
-    (list-reverse* sequence)
-    (vector-reverse* sequence)
+    (list-reverse sequence)
+    (vector-reverse sequence)
     ;; The type deriver says that LIST => LIST and VECTOR => VECTOR
     ;; but does not claim to know anything about extended-sequences.
     ;; So this could theoretically return any subtype of SEQUENCE
@@ -782,43 +781,109 @@ many elements are copied."
     ;; reversed. [Is that too weird? Make this EXTENDED-SEQUENCE maybe?]
     (the consed-sequence (values (sb!sequence:reverse sequence)))))
 
-;;; internal frobs
+(defun list-reverse (list)
+  (do ((new-list ()))
+      ((endp list) new-list)
+    (push (pop list) new-list)))
 
-(defun list-reverse* (sequence)
-  (list-reverse-macro sequence))
+(defmacro word-specialized-vector-tag-p (tag)
+  `(or
+    ,@(loop for saetp across sb!vm:*specialized-array-element-type-properties*
+           when (and (eq (sb!vm:saetp-n-bits saetp) sb!vm:n-word-bits)
+                     (not (eq (sb!vm:saetp-specifier saetp) t)))
+           collect `(eq ,tag ,(sb!vm:saetp-typecode saetp)))))
 
-(defun vector-reverse* (sequence)
-  (vector-reverse sequence))
+(defun reverse-word-specialized-vector (from to end)
+  (declare (vector from))
+  (do ((length (length from))
+       (left-index 0 (1+ left-index))
+       (right-index end))
+      ((= left-index length))
+    (declare (type index left-index right-index))
+    (decf right-index)
+    (setf (%vector-raw-bits to left-index)
+          (%vector-raw-bits from right-index)))
+  to)
+
+(defun vector-reverse (vector)
+  (declare (vector vector))
+  (let ((length (length vector)))
+    (with-array-data ((vector vector) (start) (end)
+                      :check-fill-pointer t)
+      (declare (ignore start))
+      (let* ((tag (%other-pointer-widetag vector))
+             (new-vector (allocate-vector-with-widetag tag length)))
+        (cond ((= tag sb!vm:simple-vector-widetag)
+               (do ((left-index 0 (1+ left-index))
+                    (right-index end))
+                   ((= left-index length))
+                 (declare (type index left-index right-index))
+                 (decf right-index)
+                 (setf (svref new-vector left-index)
+                       (svref vector right-index))))
+              ((word-specialized-vector-tag-p tag)
+               (reverse-word-specialized-vector vector new-vector end))
+              (t
+               (let ((getter (the function (svref %%data-vector-reffers%% tag)))
+                     (setter (the function (svref %%data-vector-setters%% tag))))
+                 (declare (fixnum length))
+                 (do ((forward-index 0 (1+ forward-index))
+                      (backward-index (1- end) (1- backward-index)))
+                     ((= forward-index length))
+                   (declare (fixnum forward-index backward-index))
+                   (funcall setter new-vector forward-index
+                            (funcall getter vector backward-index))))))
+        new-vector))))
 
 ;;;; NREVERSE
 
-(eval-when (:compile-toplevel :execute)
+(defun list-nreverse (list)
+  (do ((1st (cdr list) (if (endp 1st) 1st (cdr 1st)))
+       (2nd list 1st)
+       (3rd '() 2nd))
+      ((atom 2nd) 3rd)
+    (rplacd 2nd 3rd)))
 
-(sb!xc:defmacro vector-nreverse (sequence)
-  `(let ((length (length (the vector ,sequence))))
-     (when (>= length 2)
-       (do ((left-index 0 (1+ left-index))
-            (right-index (1- length) (1- right-index)))
-           ((<= right-index left-index))
-         (declare (type index left-index right-index))
-         (rotatef (aref ,sequence left-index)
-                  (aref ,sequence right-index))))
-     ,sequence))
+(defun nreverse-word-specialized-vector (vector start end)
+  (do ((left-index start (1+ left-index))
+       (right-index (1- end) (1- right-index)))
+      ((<= right-index left-index))
+    (declare (type index left-index right-index))
+    (let ((left (%vector-raw-bits vector left-index))
+          (right (%vector-raw-bits vector right-index)))
+      (setf (%vector-raw-bits vector left-index) right
+            (%vector-raw-bits vector right-index) left)))
+  vector)
 
-(sb!xc:defmacro list-nreverse-macro (list)
-  `(do ((1st (cdr ,list) (if (endp 1st) 1st (cdr 1st)))
-        (2nd ,list 1st)
-        (3rd '() 2nd))
-       ((atom 2nd) 3rd)
-     (rplacd 2nd 3rd)))
-
-) ; EVAL-WHEN
-
-(defun list-nreverse* (sequence)
-  (list-nreverse-macro sequence))
-
-(defun vector-nreverse* (sequence)
-  (vector-nreverse sequence))
+(defun vector-nreverse (vector)
+  (declare (vector vector))
+  (when (> (length vector) 1)
+    (with-array-data ((vector vector) (start) (end)
+                      :check-fill-pointer t)
+      (let ((tag (%other-pointer-widetag vector)))
+        (cond ((= tag sb!vm:simple-vector-widetag)
+               (do ((left-index start (1+ left-index))
+                    (right-index (1- end) (1- right-index)))
+                   ((<= right-index left-index))
+                 (declare (type index left-index right-index))
+                 (let ((left (svref vector left-index))
+                       (right (svref vector right-index)))
+                   (setf (svref vector left-index) right
+                         (svref vector right-index) left))))
+              ((word-specialized-vector-tag-p tag)
+               (nreverse-word-specialized-vector vector start end))
+              (t
+               (let* ((getter (the function (svref %%data-vector-reffers%% tag)))
+                      (setter (the function (svref %%data-vector-setters%% tag))))
+                 (do ((left-index start (1+ left-index))
+                      (right-index (1- end) (1- right-index)))
+                     ((<= right-index left-index))
+                   (declare (type index left-index right-index))
+                   (let ((left (funcall getter vector left-index))
+                         (right (funcall getter vector right-index)))
+                     (funcall setter vector left-index right)
+                     (funcall setter vector right-index left)))))))))
+  vector)
 
 (defun nreverse (sequence)
   #!+sb-doc
@@ -826,14 +891,13 @@ many elements are copied."
    is destroyed."
   (declare (explicit-check))
   (seq-dispatch-checking sequence
-    (list-nreverse* sequence)
-    (vector-nreverse* sequence)
+    (list-nreverse sequence)
+    (vector-nreverse sequence)
     ;; The type deriver for this is 'result-type-first-arg',
     ;; meaning it should return definitely an EXTENDED-SEQUENCE
     ;; and not a list or vector.
     (the extended-sequence (values (sb!sequence:nreverse sequence)))))
 
-;;;; CONCATENATE
 
 (defmacro sb!sequence:dosequence ((element sequence &optional return) &body body)
   #!+sb-doc
@@ -848,6 +912,7 @@ many elements are copied."
              (do-vector-data (,element ,sequence ,return) ,@body)
              (multiple-value-bind (,state ,limit ,from-end ,step ,endp ,elt)
                  (sb!sequence:make-sequence-iterator ,sequence)
+               (declare (function ,step ,endp ,elt))
                (do ((,state ,state (funcall ,step ,sequence ,state ,from-end)))
                    ((funcall ,endp ,sequence ,state ,limit ,from-end)
                     (let ((,element nil))
@@ -860,21 +925,16 @@ many elements are copied."
                       ,@forms))))))))))
 
 
-(defun concatenate (output-type-spec &rest sequences)
+;;;; CONCATENATE
+
+(defun concatenate (result-type &rest sequences)
   #!+sb-doc
   "Return a new sequence of all the argument sequences concatenated together
   which shares no structure with the original argument sequences of the
-  specified OUTPUT-TYPE-SPEC."
-  (declare (explicit-check))
-  (flet ((concat-to-list* (sequences)
-           (let ((result (list nil)))
-             (do ((sequences sequences (cdr sequences))
-                  (splice result))
-                 ((null sequences) (cdr result))
-               (let ((sequence (car sequences)))
-                 (sb!sequence:dosequence (e sequence)
-                   (setq splice (cdr (rplacd splice (list e)))))))))
-         (concat-to-simple* (type-spec sequences)
+  specified RESULT-TYPE."
+  (declare (explicit-check)
+           (dynamic-extent sequences))
+  (flet ((concat-to-simple* (type-spec sequences)
            (do ((seqs sequences (cdr seqs))
                 (total-length 0)
                 (lengths ()))
@@ -893,69 +953,104 @@ many elements are copied."
                (declare (fixnum length))
                (setq lengths (nconc lengths (list length)))
                (setq total-length (+ total-length length))))))
-    (let ((type (specifier-type output-type-spec)))
-      (cond
-        ((csubtypep type (specifier-type 'list))
+    (case result-type
+      ;; Pick up some common cases first
+      (list
+       (apply #'%concatenate-to-list sequences))
+      ((vector simple-vector)
+       (apply #'%concatenate-to-simple-vector sequences))
+      #!+sb-unicode
+      ((string simple-string)
+       (apply #'%concatenate-to-string sequences))
+      ((simple-base-string #!-sb-unicode string #!-sb-unicode simple-string)
+       (apply #'%concatenate-to-base-string sequences))
+      (t
+       (let ((type (specifier-type result-type)))
          (cond
-           ((type= type (specifier-type 'list))
-            (concat-to-list* sequences))
-           ((eq type *empty-type*)
-            (bad-sequence-type-error nil))
-           ((type= type (specifier-type 'null))
-            (unless (every #'emptyp sequences)
-              (sequence-type-length-mismatch-error
-               type (reduce #'+ sequences :key #'length))) ; FIXME: circular list issues.
-            '())
-           ((cons-type-p type)
-            (multiple-value-bind (min exactp)
-                (sb!kernel::cons-type-length-info type)
-              (let ((length (reduce #'+ sequences :key #'length)))
-                (if exactp
-                    (unless (= length min)
-                      (sequence-type-length-mismatch-error type length))
-                    (unless (>= length min)
-                      (sequence-type-length-mismatch-error type length)))
-                (concat-to-list* sequences))))
-           (t (sequence-type-too-hairy (type-specifier type)))))
-        ((csubtypep type (specifier-type 'vector))
-         (concat-to-simple* output-type-spec sequences))
-        ((and (csubtypep type (specifier-type 'sequence))
-              (awhen (find-class output-type-spec nil)
-               ;; This function has the EXPLICIT-CHECK declaration,
-               ;; so we manually assert that it returns a SEQUENCE.
-               (the sequence
-                (apply #'sb!sequence:concatenate
-                       (sb!mop:class-prototype
-                        (sb!pcl:ensure-class-finalized it))
-                       sequences)))))
-        (t
-         (bad-sequence-type-error output-type-spec))))))
+           ((csubtypep type (specifier-type 'list))
+            (cond
+              ((type= type (specifier-type 'list))
+               (apply #'%concatenate-to-list sequences))
+              ((eq type *empty-type*)
+               (bad-sequence-type-error nil))
+              ((type= type (specifier-type 'null))
+               (unless (every #'emptyp sequences)
+                 (sequence-type-length-mismatch-error
+                  type (reduce #'+ sequences :key #'length))) ; FIXME: circular list issues.
+               '())
+              ((cons-type-p type)
+               (multiple-value-bind (min exactp)
+                   (sb!kernel::cons-type-length-info type)
+                 (let ((length (reduce #'+ sequences :key #'length)))
+                   (if exactp
+                       (unless (= length min)
+                         (sequence-type-length-mismatch-error type length))
+                       (unless (>= length min)
+                         (sequence-type-length-mismatch-error type length)))
+                   (apply #'%concatenate-to-list sequences))))
+              (t (sequence-type-too-hairy (type-specifier type)))))
+           ((csubtypep type (specifier-type 'vector))
+            (concat-to-simple* result-type sequences))
+           ((when-extended-sequence-type
+                (result-type type :expandedp nil :prototype prototype)
+              ;; This function has the EXPLICIT-CHECK declaration,
+              ;; so we manually assert that it returns a SEQUENCE.
+              (the extended-sequence
+                   (apply #'sb!sequence:concatenate prototype sequences))))
+           (t
+            (bad-sequence-type-error result-type))))))))
 
 ;;; Efficient out-of-line concatenate for strings. Compiler transforms
 ;;; CONCATENATE 'STRING &co into these.
-(macrolet ((def (name element-type)
+(macrolet ((def (name element-type &rest dispatch)
              `(defun ,name (&rest sequences)
-                (declare (dynamic-extent sequences)
-                         (explicit-check)
-                         (optimize speed)
+                (declare (explicit-check)
                          (optimize (sb!c::insert-array-bounds-checks 0)))
-                (let* ((lengths (mapcar #'length sequences))
-                       (result (make-array (the integer (apply #'+ lengths))
-                                           :element-type ',element-type))
-                       (start 0))
-                  (declare (index start))
-                  (dolist (seq sequences)
-                    (string-dispatch
-                        ((simple-array character (*))
-                         (simple-array base-char (*))
-                         t)
-                        seq
-                      (replace result seq :start1 start))
-                    (incf start (the index (pop lengths))))
-                  result))))
-  (def %concatenate-to-string character)
-  (def %concatenate-to-base-string base-char))
+                (let ((length 0))
+                  (declare (index length))
+                  (do-rest-arg ((seq) sequences)
+                    (incf length (length seq)))
+                  (let ((result (make-array length :element-type ',element-type))
+                        (start 0))
+                    (declare (index start))
+                    (do-rest-arg ((seq) sequences)
+                      (string-dispatch (,@dispatch t)
+                                       seq
+                        (let ((length (length seq)))
+                          (replace result seq :start1 start)
+                          (incf start length))))
+                    result)))))
+  #!+sb-unicode
+  (def %concatenate-to-string character
+    (simple-array character (*)) (simple-array base-char (*)))
+  (def %concatenate-to-base-string base-char
+    (simple-array base-char (*)) #!+sb-unicode (simple-array character (*)))
+  (def %concatenate-to-simple-vector t simple-vector))
 
+(defun %concatenate-to-list (&rest sequences)
+  (declare (explicit-check))
+  (let* ((result (list nil))
+         (splice result))
+    (do-rest-arg ((sequence) sequences)
+      (sb!sequence:dosequence (e sequence)
+        (setf splice (cdr (rplacd splice (list e))))))
+    (cdr result)))
+
+(defun %concatenate-to-vector (widetag &rest sequences)
+  (declare (explicit-check))
+  (let ((length 0))
+    (declare (index length))
+    (do-rest-arg ((seq) sequences)
+      (incf length (length seq)))
+    (let ((result (allocate-vector-with-widetag widetag length))
+          (setter (the function (svref %%data-vector-setters%% widetag)))
+          (index 0))
+      (declare (index index))
+      (do-rest-arg ((seq) sequences)
+        (sb!sequence:dosequence (e seq)
+          (funcall setter result index e)
+          (incf index)))
+      result)))
 
 ;;;; MAP
 
@@ -1088,15 +1183,14 @@ many elements are copied."
                   (%map-to-list really-fun sequences))
                  ((csubtypep type (specifier-type 'vector))
                   (%map-to-vector result-type really-fun sequences))
-                 ((and (csubtypep type (specifier-type 'sequence))
-                       (awhen (find-class result-type nil)
-                         ;; This function has the EXPLICIT-CHECK declaration,
-                         ;; so we manually assert that it returns a SEQUENCE.
-                         (the sequence
-                              (apply #'sb!sequence:map
-                                     (sb!mop:class-prototype
-                                      (sb!pcl:ensure-class-finalized it))
-                                     really-fun sequences)))))
+                 ((when-extended-sequence-type
+                      (result-type type :expandedp nil :prototype prototype)
+                    ;; This function has the EXPLICIT-CHECK
+                    ;; declaration, so we manually assert that it
+                    ;; returns a SEQUENCE.
+                    (the extended-sequence
+                         (apply #'sb!sequence:map
+                                prototype really-fun sequences))))
                  (t
                   (bad-sequence-type-error result-type))))))
     ;; Handle some easy cases faster
@@ -1175,6 +1269,7 @@ many elements are copied."
 ;;; safety is turned off for vectors and lists but kept for generic
 ;;; sequences.
 (defun map-into (result-sequence function &rest sequences)
+  (declare (optimize (sb!c::check-tag-existence 0)))
   (let ((really-fun (%coerce-callable-to-fun function)))
     (etypecase result-sequence
       (vector
@@ -1937,73 +2032,88 @@ many elements are copied."
 ;;;; SUBSTITUTE
 
 (defun list-substitute* (pred new list start end count key test test-not old)
-  (declare (fixnum start end count))
+  (declare (fixnum start end count)
+           (type (or null function) key)
+           (optimize speed))
   (let* ((result (list nil))
+         (test (or test-not test))
+         (test-not (or test-not
+                       (eq pred 'if-not)))
          elt
          (splice result)
          (list list))      ; Get a local list for a stepper.
+    (declare (function test))
     (do ((index 0 (1+ index)))
         ((= index start))
       (declare (fixnum index))
-      (setq splice (cdr (rplacd splice (list (car list)))))
-      (setq list (cdr list)))
+      (setf splice (cdr (rplacd splice (list (car list))))
+            list (cdr list)))
     (do ((index start (1+ index)))
         ((or (= index end) (null list) (= count 0)))
       (declare (fixnum index))
-      (setq elt (car list))
-      (setq splice
+      (setf elt (car list)
+            splice
             (cdr (rplacd splice
                          (list
-                          (cond
-                           ((case pred
-                                   (normal
-                                    (if test-not
-                                        (not
-                                         (funcall test-not old (apply-key key elt)))
-                                        (funcall test old (apply-key key elt))))
-                                   (if (funcall test (apply-key key elt)))
-                                   (if-not (not (funcall test (apply-key key elt)))))
-                            (decf count)
-                            new)
-                                (t elt))))))
-      (setq list (cdr list)))
+                          (cond ((let* ((elt (apply-key key elt))
+                                        (value (if (eq pred 'normal)
+                                                   (funcall test old elt)
+                                                   (funcall test elt))))
+                                   (if test-not
+                                       (not value)
+                                       value))
+                                 (decf count)
+                                 new)
+                                (t elt)))))
+            list (cdr list)))
     (do ()
         ((null list))
-      (setq splice (cdr (rplacd splice (list (car list)))))
-      (setq list (cdr list)))
+      (setf splice (cdr (rplacd splice (list (car list))))
+            list (cdr list)))
     (cdr result)))
 
 ;;; Replace old with new in sequence moving from left to right by incrementer
 ;;; on each pass through the loop. Called by all three substitute functions.
 (defun vector-substitute* (pred new sequence incrementer left right length
                            start end count key test test-not old)
-  (declare (fixnum start count end incrementer right))
-  (let ((result (%make-sequence-like sequence length))
-        (index left))
-    (declare (fixnum index))
+  (declare (fixnum start count end incrementer right)
+           (type (or null function) key))
+  (let* ((result (make-vector-like sequence length))
+         (getter (the function (svref %%data-vector-reffers%%
+                                      (%other-pointer-widetag sequence))))
+         (setter (the function (svref %%data-vector-setters%%
+                                      (%other-pointer-widetag result))))
+         (test (or test-not test))
+         (test-not (or test-not
+                       (eq pred 'if-not)))
+         (index left))
+    (declare (fixnum index)
+             (function test))
     (do ()
         ((= index start))
-      (setf (aref result index) (aref sequence index))
-      (setq index (+ index incrementer)))
+      (funcall setter result index
+               (funcall getter sequence index))
+      (incf index incrementer))
     (do ((elt))
         ((or (= index end) (= count 0)))
-      (setq elt (aref sequence index))
-      (setf (aref result index)
-            (cond ((case pred
-                          (normal
-                            (if test-not
-                                (not (funcall test-not old (apply-key key elt)))
-                                (funcall test old (apply-key key elt))))
-                          (if (funcall test (apply-key key elt)))
-                          (if-not (not (funcall test (apply-key key elt)))))
-                   (setq count (1- count))
-                   new)
-                  (t elt)))
-      (setq index (+ index incrementer)))
+      (setf elt (funcall getter sequence index))
+      (funcall setter result index
+               (cond ((let* ((elt (apply-key key elt))
+                             (value (if (eq pred 'normal)
+                                        (funcall test old elt)
+                                        (funcall test elt))))
+                        (if test-not
+                            (not value)
+                            value))
+                      (decf count)
+                      new)
+                     (t elt)))
+      (incf index incrementer))
     (do ()
         ((= index right))
-      (setf (aref result index) (aref sequence index))
-      (setq index (+ index incrementer)))
+      (funcall setter result index
+               (funcall getter sequence index))
+      (incf index incrementer))
     result))
 
 (eval-when (:compile-toplevel :execute)
@@ -2112,30 +2222,41 @@ many elements are copied."
     (apply #'sb!sequence:nsubstitute new old sequence args)))
 
 (defun nlist-substitute* (new old sequence test test-not start end count key)
-  (declare (fixnum start count end))
-  (do ((list (nthcdr start sequence) (cdr list))
+  (declare (fixnum start count end)
+           (type (or null function) key))
+  (do ((test (or test-not test))
+       (list (nthcdr start sequence) (cdr list))
        (index start (1+ index)))
       ((or (= index end) (null list) (= count 0)) sequence)
-    (declare (fixnum index))
-    (when (if test-not
-              (not (funcall test-not old (apply-key key (car list))))
-              (funcall test old (apply-key key (car list))))
-      (rplaca list new)
-      (setq count (1- count)))))
+    (declare (fixnum index)
+             (function test))
+    (let ((value (funcall test old (apply-key key (car list)))))
+     (when (if test-not
+               (not value)
+               value)
+       (rplaca list new)
+       (decf count)))))
 
 (defun nvector-substitute* (new old sequence incrementer
                             test test-not start end count key)
-  (declare (fixnum start incrementer count end))
-  (do ((index start (+ index incrementer)))
-      ((or (= index end) (= count 0)) sequence)
-    (declare (fixnum index))
-    (when (if test-not
-              (not (funcall test-not
-                            old
-                            (apply-key key (aref sequence index))))
-              (funcall test old (apply-key key (aref sequence index))))
-      (setf (aref sequence index) new)
-      (setq count (1- count)))))
+  (declare (fixnum start count end)
+           (type (integer -1 1) incrementer)
+           (type (or null function) key))
+  (let* ((test (or test-not test))
+         (tag (%other-pointer-widetag sequence))
+         (getter (the function (svref %%data-vector-reffers%% tag)))
+         (setter (the function (svref %%data-vector-setters%% tag))))
+    (declare (function test))
+    (do ((index start (+ index incrementer)))
+        ((or (= index end) (= count 0)) sequence)
+      (declare (fixnum index))
+      (let* ((value (apply-key key (funcall getter sequence index)))
+             (test (and (funcall test old value) 0)))
+        (when (if test-not
+                  (not test)
+                  test)
+          (funcall setter sequence index new)
+          (decf count))))))
 
 ;;;; NSUBSTITUTE-IF, NSUBSTITUTE-IF-NOT
 
@@ -2166,24 +2287,32 @@ many elements are copied."
     (apply #'sb!sequence:nsubstitute-if new predicate sequence args)))
 
 (defun nlist-substitute-if* (new test sequence start end count key)
-  (declare (type fixnum end)
+  (declare (type fixnum start end count)
+           (type (or null function) key)
            (type function test)) ; coercion is done by caller
   (do ((list (nthcdr start sequence) (cdr list))
        (index start (1+ index)))
       ((or (= index end) (null list) (= count 0)) sequence)
+    (declare (fixnum index))
     (when (funcall test (apply-key key (car list)))
       (rplaca list new)
-      (setq count (1- count)))))
+      (decf count))))
 
 (defun nvector-substitute-if* (new test sequence incrementer
                                start end count key)
-  (declare (type fixnum end)
+  (declare (type fixnum end count)
+           (type (integer -1 1) incrementer)
+           (type (or null function) key)
            (type function test)) ; coercion is done by caller
-  (do ((index start (+ index incrementer)))
-      ((or (= index end) (= count 0)) sequence)
-    (when (funcall test (apply-key key (aref sequence index)))
-      (setf (aref sequence index) new)
-      (setq count (1- count)))))
+  (let* ((tag (%other-pointer-widetag sequence))
+         (getter (the function (svref %%data-vector-reffers%% tag)))
+         (setter (the function (svref %%data-vector-setters%% tag))))
+    (do ((index start (+ index incrementer)))
+        ((or (= index end) (= count 0)) sequence)
+      (declare (fixnum index))
+      (when (funcall test (apply-key key (funcall getter sequence index)))
+        (funcall setter sequence index new)
+        (decf count)))))
 
 (define-sequence-traverser nsubstitute-if-not
     (new predicate sequence &rest args &key from-end start end count key)
@@ -2212,24 +2341,32 @@ many elements are copied."
     (apply #'sb!sequence:nsubstitute-if-not new predicate sequence args)))
 
 (defun nlist-substitute-if-not* (new test sequence start end count key)
-  (declare (type fixnum end)
-           (type function test)) ; coercion is done by caller
+  (declare (type fixnum start end count)
+           (type (or null function) key)
+           (type function test))        ; coercion is done by caller
   (do ((list (nthcdr start sequence) (cdr list))
        (index start (1+ index)))
       ((or (= index end) (null list) (= count 0)) sequence)
+    (declare (fixnum index))
     (when (not (funcall test (apply-key key (car list))))
       (rplaca list new)
       (decf count))))
 
 (defun nvector-substitute-if-not* (new test sequence incrementer
                                    start end count key)
-  (declare (type fixnum end)
-           (type function test)) ; coercion is done by caller
-  (do ((index start (+ index incrementer)))
-      ((or (= index end) (= count 0)) sequence)
-    (when (not (funcall test (apply-key key (aref sequence index))))
-      (setf (aref sequence index) new)
-      (decf count))))
+  (declare (type fixnum end count)
+           (type (integer -1 1) incrementer)
+           (type (or null function) key)
+           (type function test))        ; coercion is done by caller
+  (let* ((tag (%other-pointer-widetag sequence))
+         (getter (the function (svref %%data-vector-reffers%% tag)))
+         (setter (the function (svref %%data-vector-setters%% tag))))
+    (do ((index start (+ index incrementer)))
+        ((or (= index end) (= count 0)) sequence)
+      (declare (fixnum index))
+      (when (not (funcall test (apply-key key (funcall getter sequence index))))
+        (funcall setter sequence index new)
+        (decf count)))))
 
 ;;;; FIND, POSITION, and their -IF and -IF-NOT variants
 

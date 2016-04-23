@@ -150,7 +150,7 @@
   ;; is disjoint from MEMBER-TYPE and so forth. But types which can
   ;; contain other types, like HAIRY-TYPE and INTERSECTION-TYPE, can
   ;; violate this rule.
-  (might-contain-other-types-p nil)
+  (might-contain-other-types-p nil :type boolean :read-only t)
   ;; a function which returns T if the CTYPE could possibly be
   ;; equivalent to a MEMBER type. If not a function, then it's
   ;; a constant T or NIL for all instances of this type class.
@@ -162,7 +162,7 @@
   ;; set enumerable=T for NEGATION and HAIRY and some other things.
   ;; Conceptually the choices are really {yes, no, unknown}, but
   ;; whereas "no" means "definitely not", T means "yes or maybe".
-  (enumerable-p nil :type (or function null t))
+  (enumerable-p nil :type (or function boolean) :read-only t)
   ;; a function which returns T if the CTYPE is inhabited by a single
   ;; object and, as a value, the object.  Otherwise, returns NIL, NIL.
   ;; The default case (NIL) is interpreted as a function that always
@@ -362,7 +362,10 @@
                                 (,(!type-class-fun-slot name) parent))))))))
     #-sb-xc
     `(if (find ',name *type-classes* :key #'type-class-name)
-         (warn "Not redefining type-class ~S" ',name)
+         ;; Careful: type-classes are very complicated things to redefine.
+         ;; For the sake of parallelized make-host-1 we have to allow it
+         ;; not to be an error to get here, but we can't overwrite anything.
+         (style-warn "Not redefining type-class ~S" ',name)
          (vector-push-extend ,make-it *type-classes*))
     ;; The Nth entry in the array of classes contain a list of instances
     ;; of the type-class created by genesis that need patching.
@@ -387,7 +390,10 @@
             (princ (length backpatch-list))
             (terpri))
           (dolist (instance backpatch-list)
-            (setf (%instance-ref instance ,slot-index) type-class)))))))
+            ;; Fixup the class first, in case fixing the hash needs the class.
+            ;; (It doesn't currently, but just in case it does)
+            (setf (%instance-ref instance ,slot-index) type-class)
+            (!fix-ctype-hash instance)))))))
 
 ;;; Define the translation from a type-specifier to a type structure for
 ;;; some particular type. Syntax is identical to DEFTYPE.
@@ -408,17 +414,18 @@
          (lexpr (make-macro-lambda nil lambda-list stuff nil nil
                                    :accessor (if allow-atom 'identity 'cdr)
                                    :environment nil))
-         (ll-decl (third lexpr)))
+         (ll-decl (third lexpr))
+         (defun-name (symbolicate "PARSE-<" name ">")))
     (aver (and (eq (car ll-decl) 'declare) (caadr ll-decl) 'sb!c::lambda-list))
-    `(!cold-init-forms
-      (setf (info :type :expander ',name)
-            (list
-             (named-lambda ,(format nil "~A-TYPE-PARSE" name) (,context spec)
-              ,ll-decl
-              ,@(unless context-var-p `((declare (ignore ,context))))
-              ,(if allow-atom
-                   `(,lexpr (and (listp spec) (cdr spec)))
-                   `(if (listp spec) (,lexpr spec)))))))))
+    `(progn
+       (defun ,defun-name (,context spec)
+         ,ll-decl
+         ,@(unless context-var-p `((declare (ignore ,context))))
+         ,(if allow-atom
+              `(,lexpr (and (listp spec) (cdr spec)))
+              `(if (listp spec) (,lexpr spec))))
+       (!cold-init-forms
+        (setf (info :type :expander ',name) (list #',defun-name))))))
 
 ;;; Invoke a type method on TYPE1 and TYPE2. If the two types have the
 ;;; same class, invoke the simple method. Otherwise, invoke any
@@ -535,6 +542,17 @@
                        (:copier nil))
   (name nil :type symbol :read-only t))
 
+;;; A MEMBER-TYPE represent a use of the MEMBER type specifier. We
+;;; bother with this at this level because MEMBER types are fairly
+;;; important and union and intersection are well defined.
+(defstruct (member-type (:include ctype
+                                  (class-info (type-class-or-lose 'member)))
+                        (:copier nil)
+                        (:constructor %make-member-type (xset fp-zeroes))
+                        #-sb-xc-host (:pure nil))
+  (xset nil :type xset :read-only t)
+  (fp-zeroes nil :type list :read-only t))
+
 ;;; An ARRAY-TYPE is used to represent any array type, including
 ;;; things such as SIMPLE-BASE-STRING.
 (defstruct (array-type (:include ctype
@@ -628,7 +646,7 @@
                          (:copier nil))
   ;; Formerly defined in every CTYPE, but now just in the ones
   ;; for which enumerability is variable.
-  (enumerable nil :read-only t)
+  (enumerable nil :type boolean :read-only t)
   ;; the kind of numeric type we have, or NIL if not specified (just
   ;; NUMBER or COMPLEX)
   ;;

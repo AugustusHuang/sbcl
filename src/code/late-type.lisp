@@ -64,7 +64,15 @@
    (negation-type (contains-unknown-type-p (negation-type-type ctype)))
    (cons-type (or (contains-unknown-type-p (cons-type-car-type ctype))
                   (contains-unknown-type-p (cons-type-cdr-type ctype))))
-   (array-type (contains-unknown-type-p (array-type-element-type ctype)))))
+   (array-type (contains-unknown-type-p (array-type-element-type ctype)))
+   (args-type
+    (or (some #'contains-unknown-type-p (args-type-required ctype))
+        (some #'contains-unknown-type-p (args-type-optional ctype))
+        (acond ((args-type-rest ctype) (contains-unknown-type-p it)))
+        (some (lambda (x) (contains-unknown-type-p (key-info-type x)))
+              (args-type-keywords ctype))
+        (and (fun-type-p ctype)
+             (contains-unknown-type-p (fun-type-returns ctype)))))))
 
 ;; Similar to (NOT CONTAINS-UNKNOWN-TYPE-P), but report that (SATISFIES F)
 ;; is not a testable type unless F is currently bound.
@@ -102,15 +110,19 @@
        ;; explaining to us mere mortals how it works...
        (and (sb!xc:typep type2 'classoid)
             (dolist (x info nil)
-              (when (or (not (cdr x))
-                        (csubtypep type1 (specifier-type (cdr x))))
+             (let ((guard (cdr x)))
+              (when (or (not guard)
+                        (csubtypep type1 (if (%instancep guard)
+                                             guard
+                                             (setf (cdr x)
+                                                   (specifier-type guard)))))
                 (return
                  (or (eq type2 (car x))
                      (let ((inherits (layout-inherits
                                       (classoid-layout (car x)))))
                        (dotimes (i (length inherits) nil)
                          (when (eq type2 (layout-classoid (svref inherits i)))
-                           (return t)))))))))
+                           (return t))))))))))
        t)))
 
 ;;; This function takes a list of specs, each of the form
@@ -125,23 +137,24 @@
 ;;;    G0,(and G1 (not G0)), (and G2 (not (or G0 G1))).
 ;;;
 ;;; WHEN controls when the forms are executed.
-(defmacro !define-superclasses (type-class-name specs when)
-  (with-unique-names (type-class info)
-    `(,when
-       (let ((,type-class (type-class-or-lose ',type-class-name))
-             (,info (mapcar (lambda (spec)
-                              (destructuring-bind
-                                  (super &optional guard)
-                                  spec
-                                (cons (find-classoid super) guard)))
-                            ',specs)))
-         (setf (type-class-complex-subtypep-arg1 ,type-class)
-               (lambda (type1 type2)
-                 (has-superclasses-complex-subtypep-arg1 type1 type2 ,info)))
-         (setf (type-class-complex-subtypep-arg2 ,type-class)
+(defmacro !define-superclasses (type-class-name specs progn-oid)
+  (let ((defun-name (symbolicate type-class-name "-COMPLEX-SUBTYPEP-ARG1")))
+    `(progn
+       (defun ,defun-name (type1 type2)
+         (has-superclasses-complex-subtypep-arg1
+          type1 type2
+          (load-time-value
+           (list ,@(mapcar (lambda (spec)
+                             (destructuring-bind (super &optional guard) spec
+                               `(cons (find-classoid ',super) ',guard)))
+                           specs)) #-sb-xc-host t)))
+       (,progn-oid
+        (let ((type-class (type-class-or-lose ',type-class-name)))
+         (setf (type-class-complex-subtypep-arg1 type-class) #',defun-name)
+         (setf (type-class-complex-subtypep-arg2 type-class)
                #'delegate-complex-subtypep-arg2)
-         (setf (type-class-complex-intersection2 ,type-class)
-               #'delegate-complex-intersection2)))))
+         (setf (type-class-complex-intersection2 type-class)
+               #'delegate-complex-intersection2))))))
 
 ;;;; FUNCTION and VALUES types
 ;;;;
@@ -202,9 +215,6 @@
 
 (!define-type-method (values :simple-=) (type1 type2)
   (type=-args type1 type2))
-
-(!define-type-class function :enumerable nil
-                    :might-contain-other-types nil)
 
 ;;; a flag that we can bind to cause complex function types to be
 ;;; unparsed as FUNCTION. This is useful when we want a type that we
@@ -1014,7 +1024,7 @@
 
 ;;; Don't try to define a print method until it's actually gonna work!
 ;;; (Otherwise this would be near the DEFSTRUCT)
-(def!method print-object ((ctype ctype) stream)
+(defmethod print-object ((ctype ctype) stream)
   (print-unreadable-object (ctype stream :type t)
     (prin1 (type-specifier ctype) stream)))
 
@@ -1148,41 +1158,6 @@
           simplified-types)))))
 
 ;;;; built-in types
-
-;; This is used when parsing (SATISFIES KEYWORDP)
-;; so that simplifications can be made when computing intersections,
-;; without which we would see this kind of "empty-type in disguise"
-;;   (AND (SATISFIES KEYWORDP) CONS)
-;; This isn't *keyword-type* because KEYWORD is implemented
-;; as the intersection of SYMBOL and (SATISFIES KEYWORDP)
-;; We could also intern the KEYWORD type but that would require
-;; hacking the INTERSECTION logic.
-(defglobal *satisfies-keywordp-type* -1)
-
-;; Here too I discovered more than 1000 instances in a particular
-;; Lisp image, when really this is *EMPTY-TYPE*.
-;;  (AND (SATISFIES LEGAL-FUN-NAME-P) (SIMPLE-ARRAY CHARACTER (*)))
-(defglobal *fun-name-type* -1)
-
-;; !LATE-TYPE-COLD-INIT can't be GCd - there are lambdas in the toplevel code
-;; component that leak out and persist - but everything below is GCable.
-;; This leads to about 20KB of extra code being retained on x86-64.
-;; An educated guess is that DEFINE-SUPERCLASSES is responsible for the problem.
-(defun !late-type-cold-init2 ()
- (!intern-important-fun-type-instances)
- (!intern-important-member-type-instances)
- (!intern-important-cons-type-instances)
- (!intern-important-numeric-type-instances)
- (!intern-important-character-set-type-instances)
- (!intern-important-array-type-instances) ; must be after numeric and char
- (setf *satisfies-keywordp-type*
-       (mark-ctype-interned (%make-hairy-type '(satisfies keywordp))))
- (setf *fun-name-type*
-       (mark-ctype-interned (%make-hairy-type '(satisfies legal-fun-name-p))))
- ;; This is not an important type- no attempt is made to return exactly this
- ;; object when parsing FUNCTION. In fact we return the classoid instead
- (setf *universal-fun-type*
-       (make-fun-type :wild-args t :returns *wild-type*)))
 
 (!define-type-method (named :simple-=) (type1 type2)
   ;;(aver (not (eq type1 *wild-type*))) ; * isn't really a type.
@@ -1338,6 +1313,19 @@
          ;; rewrite it so that it's clearer.
          (values nil t))))
 
+(!define-type-method (named :simple-intersection2) (type1 type2)
+  (cond
+    ((and (eq type1 *extended-sequence-type*)
+          (or (eq type2 *instance-type*)
+              (eq type2 *funcallable-instance-type*)))
+     nil)
+    ((and (or (eq type1 *instance-type*)
+              (eq type1 *funcallable-instance-type*))
+          (eq type2 *extended-sequence-type*))
+     nil)
+    (t
+     (hierarchical-intersection2 type1 type2))))
+
 (!define-type-method (named :complex-intersection2) (type1 type2)
   ;; FIXME: This assertion failed when I added it in sbcl-0.6.11.13.
   ;; Perhaps when bug 85 is fixed it can be reenabled.
@@ -1490,17 +1478,17 @@
                      (type1 type2)
  (acond ((type= type1 type2)
          type1)
-        ((eq type2 *satisfies-keywordp-type*)
+        ((eq type2 (literal-ctype *satisfies-keywordp-type*))
          ;; (AND (MEMBER A) (SATISFIES KEYWORDP)) is possibly non-empty
          ;; if A is re-homed as :A. However as a special case that really
          ;; does occur, (AND (MEMBER NIL) (SATISFIES KEYWORDP))
          ;; is empty because of the illegality of changing NIL's package.
-         (if (eq type1 *null-type*)
+         (if (eq type1 (specifier-type 'null))
              *empty-type*
              (multiple-value-bind (answer certain)
                  (types-equal-or-intersect type1 (specifier-type 'symbol))
                (and (not answer) certain *empty-type*))))
-        ((eq type2 *fun-name-type*)
+        ((eq type2 (literal-ctype *fun-name-type*))
          (multiple-value-bind (answer certain)
              (types-equal-or-intersect type1 (specifier-type 'symbol))
            (and (not answer)
@@ -1535,8 +1523,8 @@
            :format-control "The SATISFIES predicate name is not a symbol: ~S"
            :format-arguments (list predicate-name)))
   (case predicate-name
-   (keywordp *satisfies-keywordp-type*)
-   (legal-fun-name-p *fun-name-type*)
+   (keywordp (literal-ctype *satisfies-keywordp-type*))
+   (legal-fun-name-p (literal-ctype *fun-name-type*))
    (t (%make-hairy-type whole))))
 
 ;;;; negation types
@@ -1716,9 +1704,6 @@
   (type-negation (specifier-type-r context typespec)))
 
 ;;;; numeric types
-
-(!define-type-class number :enumerable #'numeric-type-enumerable
-                    :might-contain-other-types nil)
 
 (declaim (inline numeric-type-equal))
 (defun numeric-type-equal (type1 type2)
@@ -1927,39 +1912,39 @@
              (or (eql low-value high-bound)
                  (and (eql low-value
                            (load-time-value (make-unportable-float
-                                             :single-float-negative-zero)))
+                                             :single-float-negative-zero) t))
                       (eql high-bound 0f0))
                  (and (eql low-value 0f0)
                       (eql high-bound
                            (load-time-value (make-unportable-float
-                                             :single-float-negative-zero))))
+                                             :single-float-negative-zero) t)))
                  (and (eql low-value
                            (load-time-value (make-unportable-float
-                                             :double-float-negative-zero)))
+                                             :double-float-negative-zero) t))
                       (eql high-bound 0d0))
                  (and (eql low-value 0d0)
                       (eql high-bound
                            (load-time-value (make-unportable-float
-                                             :double-float-negative-zero)))))))
+                                             :double-float-negative-zero) t))))))
           ((consp high-bound)
            (let ((high-value (car high-bound)))
              (or (eql high-value low-bound)
                  (and (eql high-value
                            (load-time-value (make-unportable-float
-                                             :single-float-negative-zero)))
+                                             :single-float-negative-zero) t))
                       (eql low-bound 0f0))
                  (and (eql high-value 0f0)
                       (eql low-bound
                            (load-time-value (make-unportable-float
-                                             :single-float-negative-zero))))
+                                             :single-float-negative-zero) t)))
                  (and (eql high-value
                            (load-time-value (make-unportable-float
-                                             :double-float-negative-zero)))
+                                             :double-float-negative-zero) t))
                       (eql low-bound 0d0))
                  (and (eql high-value 0d0)
                       (eql low-bound
                            (load-time-value (make-unportable-float
-                                             :double-float-negative-zero)))))))
+                                             :double-float-negative-zero) t))))))
           ((and (eq (numeric-type-class low) 'integer)
                 (eq (numeric-type-class high) 'integer))
            (eql (1+ low-bound) high-bound))
@@ -2121,44 +2106,29 @@ used for a COMPLEX component.~:@>"
 
 ;;; If X is *, return NIL, otherwise return the bound, which must be a
 ;;; member of TYPE or a one-element list of a member of TYPE.
-#!-sb-fluid (declaim (inline canonicalized-bound))
-(defun canonicalized-bound (bound type)
+;;; This is not necessarily the canonical bound. An integer bound
+;;; should always be an atom, which we'll enforce later if needed.
+#!-sb-fluid (declaim (inline valid-bound))
+(defun valid-bound (bound type)
   (cond ((eq bound '*) nil)
-        ((or (sb!xc:typep bound type)
-             (and (consp bound)
-                  (sb!xc:typep (car bound) type)
-                  (null (cdr bound))))
-          bound)
+        ((sb!xc:typep (if (singleton-p bound) (car bound) bound) type) bound)
         (t
-         (error "Bound is not ~S, a ~S or a list of a ~S: ~S"
-                '*
-                type
-                type
-                bound))))
+         (error "Bound is not * or ~A ~S or list of one ~:*~S: ~S"
+                (if (eq type 'integer) "an" "a") type bound))))
 
 (!def-type-translator integer (&optional (low '*) (high '*))
-  (let* ((l (canonicalized-bound low 'integer))
-         (lb (if (consp l) (1+ (car l)) l))
-         (h (canonicalized-bound high 'integer))
-         (hb (if (consp h) (1- (car h)) h)))
-    (if (and hb lb (< hb lb))
-        *empty-type*
-      (make-numeric-type :class 'integer
-                         :complexp :real
-                         :enumerable (not (null (and l h)))
-                         :low lb
-                         :high hb))))
+  (let ((lb (valid-bound low 'integer))
+        (hb (valid-bound high 'integer)))
+    (make-numeric-type :class 'integer :complexp :real
+                       :enumerable (not (null (and lb hb)))
+                       :low lb :high hb)))
 
 (defmacro !def-bounded-type (type class format)
   `(!def-type-translator ,type (&optional (low '*) (high '*))
-     (let ((lb (canonicalized-bound low ',type))
-           (hb (canonicalized-bound high ',type)))
-       (if (not (numeric-bound-test* lb hb <= <))
-           *empty-type*
-         (make-numeric-type :class ',class
-                            :format ',format
-                            :low lb
-                            :high hb)))))
+     (let ((lb (valid-bound low ',type))
+           (hb (valid-bound high ',type)))
+       (make-numeric-type :class ',class :format ',format
+                          :low lb :high hb))))
 
 (!def-bounded-type rational rational nil)
 
@@ -2197,8 +2167,8 @@ used for a COMPLEX component.~:@>"
   #+sb-xc-host (declare (ignore upperp))
   (let #+sb-xc-host ()
        #-sb-xc-host
-       ((nl (load-time-value (symbol-value 'sb!xc:most-negative-long-float)))
-        (pl (load-time-value (symbol-value 'sb!xc:most-positive-long-float))))
+       ((nl (load-time-value (symbol-value 'sb!xc:most-negative-long-float) t))
+        (pl (load-time-value (symbol-value 'sb!xc:most-positive-long-float) t)))
     (let ((nbound (if (consp bound) (car bound) bound))
           (consp (consp bound)))
       (ecase type
@@ -2227,11 +2197,10 @@ used for a COMPLEX component.~:@>"
   #+sb-xc-host (declare (ignore upperp))
   (let #+sb-xc-host ()
        #-sb-xc-host
-       ((nd (load-time-value (symbol-value 'sb!xc:most-negative-double-float)))
-        (pd (load-time-value (symbol-value 'sb!xc:most-positive-double-float)))
-        (ns (load-time-value (symbol-value 'sb!xc:most-negative-single-float)))
-        (ps (load-time-value
-             (symbol-value 'sb!xc:most-positive-single-float))))
+       ((nd (load-time-value (symbol-value 'sb!xc:most-negative-double-float) t))
+        (pd (load-time-value (symbol-value 'sb!xc:most-positive-double-float) t))
+        (ns (load-time-value (symbol-value 'sb!xc:most-negative-single-float) t))
+        (ps (load-time-value (symbol-value 'sb!xc:most-positive-single-float) t)))
     (let ((nbound (if (consp bound) (car bound) bound))
           (consp (consp bound)))
       (ecase type
@@ -2276,14 +2245,9 @@ used for a COMPLEX component.~:@>"
                       ,(coerced-float-bound high 'double-float t))
         #!+long-float ,(error "stub: no long float support yet"))))
 
-(defmacro !define-float-format (f)
-  `(!def-bounded-type ,f float ,f))
-
-;; (!define-float-format short-float) ; it's a DEFTYPE
-(!define-float-format single-float)
-(!define-float-format double-float)
-;; long-float support is dead.
-;; (!define-float-format long-float) ; also a DEFTYPE
+(macrolet ((define-float-format (f) `(!def-bounded-type ,f float ,f)))
+  (define-float-format single-float)
+  (define-float-format double-float))
 
 (defun numeric-types-intersect (type1 type2)
   (declare (type numeric-type type1 type2))
@@ -2480,9 +2444,6 @@ used for a COMPLEX component.~:@>"
 
 ;;;; array types
 
-(!define-type-class array :enumerable nil
-                    :might-contain-other-types nil)
-
 (!define-type-method (array :simple-=) (type1 type2)
   (cond ((not (and (equal (array-type-dimensions type1)
                           (array-type-dimensions type2))
@@ -2629,9 +2590,7 @@ used for a COMPLEX component.~:@>"
                           (array-type-specialized-element-type type2))
                    t)))))
 
-(!define-superclasses array
-  ((vector vector) (array))
-  !cold-init-forms)
+(!define-superclasses array ((vector vector) (array)) !cold-init-forms)
 
 (defun array-types-intersect (type1 type2)
   (declare (type array-type type1 type2))
@@ -2856,9 +2815,6 @@ used for a COMPLEX component.~:@>"
 
 ;;;; MEMBER types
 
-(!define-type-class member :enumerable t
-                    :might-contain-other-types nil)
-
 (!define-type-method (member :negate) (type)
   (let ((xset (member-type-xset type))
         (fp-zeroes (member-type-fp-zeroes type)))
@@ -2884,9 +2840,9 @@ used for a COMPLEX component.~:@>"
         (make-negation-type type))))
 
 (!define-type-method (member :unparse) (type)
-  (let ((members (member-type-members type)))
-    (cond ((equal members '(nil)) 'null)
-          (t `(member ,@members)))))
+  (cond ((eq type (specifier-type 'null)) 'null) ; NULL type is EQ-comparable
+        ((eq type (specifier-type 'boolean)) 'boolean) ; so is BOOLEAN
+        (t `(member ,@(member-type-members type)))))
 
 (!define-type-method (member :singleton-p) (type)
   (if (eql 1 (member-type-size type))
@@ -3319,8 +3275,6 @@ used for a COMPLEX component.~:@>"
 
 ;;;; CONS types
 
-(!define-type-class cons :enumerable nil :might-contain-other-types nil)
-
 (!def-type-translator cons ((:context context)
                             &optional (car-type-spec '*) (cdr-type-spec '*))
   (let ((car-type (single-value-specifier-type-r context car-type-spec))
@@ -3354,12 +3308,10 @@ used for a COMPLEX component.~:@>"
          (t (bug "Weird CONS type ~S" type))))))
 
 (!define-type-method (cons :unparse) (type)
-  (let ((car-eltype (type-specifier (cons-type-car-type type)))
-        (cdr-eltype (type-specifier (cons-type-cdr-type type))))
-    (if (and (member car-eltype '(t *))
-             (member cdr-eltype '(t *)))
-        'cons
-        `(cons ,car-eltype ,cdr-eltype))))
+  (if (eq type (specifier-type 'cons))
+      'cons
+      `(cons ,(type-specifier (cons-type-car-type type))
+             ,(type-specifier (cons-type-cdr-type type)))))
 
 (!define-type-method (cons :simple-=) (type1 type2)
   (declare (type cons-type type1 type2))
@@ -3467,15 +3419,6 @@ used for a COMPLEX component.~:@>"
 
 ;;;; CHARACTER-SET types
 
-;; all character-set types are enumerable, but it's not possible
-;; for one to be TYPE= to a MEMBER type because (MEMBER #\x)
-;; is not internally represented as a MEMBER type.
-;; So in case it wasn't clear already ENUMERABLE-P does not mean
-;;  "possibly a MEMBER type in the Lisp-theoretic sense",
-;; but means "could be implemented in SBCL as a MEMBER type".
-(!define-type-class character-set :enumerable nil
-                    :might-contain-other-types nil)
-
 (!def-type-translator character-set
     (&optional (pairs '((0 . #.(1- sb!xc:char-code-limit)))))
   (make-character-set-type pairs))
@@ -3509,9 +3452,10 @@ used for a COMPLEX component.~:@>"
 
 (!define-type-method (character-set :unparse) (type)
   (cond
-    ((type= type (specifier-type 'character)) 'character)
-    ((type= type (specifier-type 'base-char)) 'base-char)
-    ((type= type (specifier-type 'extended-char)) 'extended-char)
+    ((eq type (specifier-type 'character)) 'character)
+    ((eq type (specifier-type 'base-char)) 'base-char)
+    ((eq type (specifier-type 'extended-char)) 'extended-char)
+    ;; standard-char is not an interned type
     ((type= type (specifier-type 'standard-char)) 'standard-char)
     (t
      ;; Unparse into either MEMBER or CHARACTER-SET. We use MEMBER if there
@@ -4024,7 +3968,5 @@ used for a COMPLEX component.~:@>"
    over under))
 
 (!defun-from-collected-cold-init-forms !late-type-cold-init)
-
-#-sb-xc (!late-type-cold-init2)
 
 (/show0 "late-type.lisp end of file")

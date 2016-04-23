@@ -68,10 +68,7 @@
          res)
     (move-lvar-result node block locs lvar)))
 
-(defun emit-inits (node block name object lowtag instance-length inits args)
-  #!+interleaved-raw-slots (declare (ignore instance-length))
-  #!-raw-instance-init-vops
-  (declare (ignore instance-length))
+(defun emit-inits (node block name object lowtag inits args)
   (let ((unbound-marker-tn nil)
         (funcallable-instance-tramp-tn nil)
         (lvar (node-lvar node)))
@@ -91,9 +88,8 @@
              (slot (cdr init)))
          (case kind
            (:slot
-            ;; FIXME: with #!+interleaved-raw-slots the only reason INIT-SLOT
-            ;; and its raw variants exist is to avoid an extra MOVE -
-            ;; setters are expected to return something, but INITers don't.
+            ;; FIXME: the only reason INIT-SLOT raw variants exist is to avoid
+            ;; an extra MOVE - setters return a value, but INITers don't.
             ;; It would probably produce better code by not assuming that
             ;; setters return a value, because as things are, if you call
             ;; 8 setters in a row, then you probably produce 7 extraneous moves,
@@ -114,9 +110,7 @@
                                (lambda (rsd)
                                  `(,(sb!kernel::raw-slot-data-raw-type rsd)
                                    (vop ,(sb!kernel::raw-slot-data-init-vop rsd)
-                                        node block object arg-tn
-                                        #!-interleaved-raw-slots instance-length
-                                        slot)))
+                                        node block object arg-tn slot)))
                                (symbol-value rsd-list)))))
                     (make-case #!+raw-instance-init-vops
                                sb!kernel::*raw-slot-data*))))))
@@ -168,7 +162,7 @@
          (locs (lvar-result-tns lvar (list *backend-t-primitive-type*)))
          (result (first locs)))
     (emit-fixed-alloc node block name words type lowtag result lvar)
-    (emit-inits node block name result lowtag words inits args)
+    (emit-inits node block name result lowtag inits args)
     (move-lvar-result node block locs lvar)))
 
 (defoptimizer ir2-convert-variable-allocation
@@ -181,7 +175,7 @@
           (emit-fixed-alloc node block name words type lowtag result lvar))
         (vop var-alloc node block (lvar-tn node block extra) name words
              type lowtag result))
-    (emit-inits node block name result lowtag nil inits args)
+    (emit-inits node block name result lowtag inits args)
     (move-lvar-result node block locs lvar)))
 
 (defoptimizer ir2-convert-structure-allocation
@@ -190,13 +184,12 @@
   (let* ((lvar (node-lvar node))
          (locs (lvar-result-tns lvar (list *backend-t-primitive-type*)))
          (result (first locs)))
-    (aver (constant-lvar-p dd))
-    (aver (constant-lvar-p slot-specs))
+    (aver (and (constant-lvar-p dd) (constant-lvar-p slot-specs) (= words 1)))
     (let* ((c-dd (lvar-value dd))
            (c-slot-specs (lvar-value slot-specs))
-           (words (+ (sb!kernel::dd-instance-length c-dd) words)))
+           (words (+ (dd-length c-dd) words)))
       (emit-fixed-alloc node block name words type lowtag result lvar)
-      (emit-inits node block name result lowtag words `((:dd . ,c-dd) ,@c-slot-specs) args)
+      (emit-inits node block name result lowtag `((:dd . ,c-dd) ,@c-slot-specs) args)
       (move-lvar-result node block locs lvar))))
 
 (defoptimizer (initialize-vector ir2-convert)
